@@ -1,0 +1,8 @@
+node_modules
+cdk.out
+.cdk.staging
+
+# TypeScript compiled output (except lambdas)
+*.js
+!lambdas/**/*.js
+*.d.ts
