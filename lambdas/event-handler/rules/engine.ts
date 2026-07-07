@@ -5,7 +5,6 @@ import {
   RuleResult,
   VendorRule,
   ConfigDefaults,
-  OrderGoodsProduct,
   QboRef,
 } from '../types'
 import { catalogReconcile } from './strategies/catalogReconcile'
@@ -53,7 +52,6 @@ export interface ApplyRulesParams {
   detail: DocumentProcessedDetail
   extractedText: string
   isMultiLine: boolean
-  products: OrderGoodsProduct[]
   qboVendorId: string
   qboVendorRef: QboRef
   rule: VendorRule | null
@@ -61,7 +59,7 @@ export interface ApplyRulesParams {
 }
 
 export const applyRules = async (params: ApplyRulesParams): Promise<RuleResult> => {
-  const { detail, extractedText, isMultiLine, products, qboVendorId, qboVendorRef, rule, config } = params
+  const { detail, extractedText, isMultiLine, qboVendorId, qboVendorRef, rule, config } = params
 
   let result: RuleResult
 
@@ -69,18 +67,16 @@ export const applyRules = async (params: ApplyRulesParams): Promise<RuleResult> 
   if (rule) {
     switch (rule.ruleType) {
       case 'catalog_reconcile':
-        result = await catalogReconcile(detail, extractedText, products, rule, config)
+        result = await catalogReconcile(detail, extractedText, rule, config)
         break
       case 'amount_range':
         result = amountRange(detail, rule.config, rule, config)
         break
       default:
-        // Unknown rule type — fall through to inferred logic
-        result = await inferStrategy(detail, extractedText, isMultiLine, products, qboVendorId, config)
+        result = await inferStrategy(detail, extractedText, isMultiLine, qboVendorId, config)
     }
   } else {
-    // No explicit rule — infer strategy from vendor classification
-    result = await inferStrategy(detail, extractedText, isMultiLine, products, qboVendorId, config)
+    result = await inferStrategy(detail, extractedText, isMultiLine, qboVendorId, config)
   }
 
   // Stamp the QBO vendor ref onto the payload if ready
@@ -95,12 +91,11 @@ const inferStrategy = async (
   detail: DocumentProcessedDetail,
   extractedText: string,
   isMultiLine: boolean,
-  products: OrderGoodsProduct[],
   qboVendorId: string,
   config: ConfigDefaults,
 ): Promise<RuleResult> => {
   if (isMultiLine) {
-    return catalogReconcile(detail, extractedText, products, null, config)
+    return catalogReconcile(detail, extractedText, null, config)
   }
   return simpleVendor(detail, qboVendorId, config)
 }

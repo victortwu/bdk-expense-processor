@@ -1,99 +1,103 @@
 import { extractLineItems } from '../../utils/extractLineItems'
 import {
   DocumentProcessedDetail,
-  OrderGoodsProduct,
   RuleResult,
   ParsedLine,
   VendorRule,
   ConfigDefaults,
 } from '../../types'
-import { DEFAULT_MATCH_THRESHOLD, DEFAULT_ARITHMETIC_TOLERANCE } from '../../constants'
+import { DEFAULT_ARITHMETIC_TOLERANCE } from '../../constants'
 
 export const catalogReconcile = async (
   detail: DocumentProcessedDetail,
   extractedText: string,
-  products: OrderGoodsProduct[],
   rule: VendorRule | null,
   config: ConfigDefaults,
 ): Promise<RuleResult> => {
-  const matchThreshold = rule?.config.matchThreshold ?? config.matchThreshold ?? DEFAULT_MATCH_THRESHOLD
   const tolerance = config.arithmeticTolerance ?? DEFAULT_ARITHMETIC_TOLERANCE
   const categoryToAccount = rule?.config.categoryToAccount || {}
+  const foodAccount = categoryToAccount['food'] || { value: '80', name: 'COG - Food' }
   const catchAllAccount = config.catchAllAccountRef
 
-  // 1. Extract line items via Bedrock
+  // 1. Extract structured data via Bedrock (subtraction-based prompt)
   const extraction = await extractLineItems(extractedText, rule?.config.extractionPrompt)
 
-  if (!extraction.lineItems.length) {
+  if (!extraction.grandTotal || extraction.grandTotal <= 0) {
     return {
       status: 'needs_input',
-      needsInputType: 'unmatched_items',
-      validationErrors: [{ field: 'lineItems', reason: 'Could not extract any line items from receipt text' }],
+      needsInputType: 'math_error',
+      validationErrors: [{
+        field: 'grandTotal',
+        reason: 'Could not extract a valid grand total from the receipt',
+      }],
     }
   }
 
-  // 2. Match extracted items to OrderGoods products
-  const parsedLines: ParsedLine[] = []
-  let matchedAmount = 0
-  let totalAmount = 0
-  const unmatchedItems: string[] = []
+  // 2. Sum non-food categories
+  const categoryTotals: Record<string, number> = {}
 
-  for (const item of extraction.lineItems) {
-    totalAmount += item.amount
+  for (const item of extraction.nonFoodItems) {
+    const category = item.category || 'uncategorized'
+    categoryTotals[category] = (categoryTotals[category] || 0) + item.amount
+  }
 
-    // Try UPC match first, then description
-    const matchedProduct = matchByUpc(item.upc, products) || matchByDescription(item.description, products)
+  const tax = extraction.tax || 0
+  const deliveryFee = extraction.deliveryFee || 0
+  const nonFoodTotal = Object.values(categoryTotals).reduce((sum, amt) => sum + amt, 0)
 
-    if (matchedProduct) {
-      const accountRef = categoryToAccount[matchedProduct.category] || catchAllAccount
-      parsedLines.push({
-        amount: item.amount,
-        accountRef,
-        description: `${matchedProduct.category} - ${item.description}`,
-      })
-      matchedAmount += item.amount
-    } else {
-      // Unmatched → catch-all account
-      parsedLines.push({
-        amount: item.amount,
-        accountRef: catchAllAccount,
-        description: `Uncategorized - ${item.description}`,
-      })
-      unmatchedItems.push(item.description)
+  // 3. Calculate Food COG as remainder
+  const foodTotal = extraction.grandTotal - tax - deliveryFee - nonFoodTotal
+
+  // 4. Sanity check — food total should be positive
+  if (foodTotal < 0) {
+    return {
+      status: 'needs_input',
+      needsInputType: 'math_error',
+      parsedLines: buildLines(foodTotal, categoryTotals, tax, deliveryFee, categoryToAccount, foodAccount, catchAllAccount),
+      validationErrors: [{
+        field: 'foodTotal',
+        reason: `Calculated food total is negative ($${foodTotal.toFixed(2)}). Non-food items ($${nonFoodTotal.toFixed(2)}) + tax ($${tax.toFixed(2)}) + delivery ($${deliveryFee.toFixed(2)}) exceed grand total ($${extraction.grandTotal.toFixed(2)}).`,
+        value: String(foodTotal),
+      }],
     }
   }
 
-  // 3. Validate arithmetic (if total available from extraction)
-  if (extraction.total && Math.abs(totalAmount - extraction.total) > tolerance) {
+  // 5. Sanity check — food should be the majority (at least 40% of pre-tax total)
+  const preTaxTotal = extraction.grandTotal - tax
+  const foodRatio = preTaxTotal > 0 ? foodTotal / preTaxTotal : 0
+  if (foodRatio < 0.4) {
+    // Unusual — flag but don't block (emit notification upstream)
+    console.warn(
+      `Food ratio unusually low (${(foodRatio * 100).toFixed(0)}%) for ${detail.vendorDisplay}. Grand: $${extraction.grandTotal}, Food: $${foodTotal.toFixed(2)}`,
+    )
+  }
+
+  // 6. Build QBO lines
+  const parsedLines = buildLines(
+    foodTotal,
+    categoryTotals,
+    tax,
+    deliveryFee,
+    categoryToAccount,
+    foodAccount,
+    catchAllAccount,
+  )
+
+  // 7. Verify our lines sum to grand total
+  const linesSum = parsedLines.reduce((sum, line) => sum + line.amount, 0)
+  if (Math.abs(linesSum - extraction.grandTotal) > tolerance) {
     return {
       status: 'needs_input',
       needsInputType: 'math_error',
       parsedLines,
       validationErrors: [{
-        field: 'total',
-        reason: `Line items sum to $${totalAmount.toFixed(2)} but receipt total is $${extraction.total.toFixed(2)}`,
-        value: String(totalAmount),
+        field: 'reconciliation',
+        reason: `Lines sum to $${linesSum.toFixed(2)} but grand total is $${extraction.grandTotal.toFixed(2)}`,
+        value: String(linesSum),
       }],
     }
   }
 
-  // 4. Check match threshold
-  const matchRatio = totalAmount > 0 ? matchedAmount / totalAmount : 0
-
-  if (matchRatio < matchThreshold && unmatchedItems.length > 0) {
-    return {
-      status: 'needs_input',
-      needsInputType: 'unmatched_items',
-      parsedLines,
-      validationErrors: [{
-        field: 'matchRatio',
-        reason: `Only ${(matchRatio * 100).toFixed(0)}% of amount matched (threshold: ${(matchThreshold * 100).toFixed(0)}%). Unmatched: ${unmatchedItems.join(', ')}`,
-        value: String(matchRatio),
-      }],
-    }
-  }
-
-  // 5. Ready — build QBO payload
   return {
     status: 'ready',
     parsedLines,
@@ -102,23 +106,67 @@ export const catalogReconcile = async (
       txnDate: detail.documentDate,
       paymentType: 'CreditCard',
       paymentAccountRef: config.paymentAccountRef,
-      entityRef: { value: '', name: '' }, // filled in by caller with resolved QBO vendor
+      entityRef: { value: '', name: '' }, // filled in by caller
       lines: parsedLines,
-      privateNote: `Auto-processed: ${detail.description || detail.vendorDisplay} [${unmatchedItems.length} unmatched items]`,
+      privateNote: `Auto-processed: ${detail.description || detail.vendorDisplay} | Food: $${foodTotal.toFixed(2)}, Non-food: $${nonFoodTotal.toFixed(2)}, Tax: $${tax.toFixed(2)}`,
     },
   }
 }
 
-const matchByUpc = (upc: string | undefined, products: OrderGoodsProduct[]): OrderGoodsProduct | undefined => {
-  if (!upc) return undefined
-  return products.find((p) => p.upc === upc)
+const buildLines = (
+  foodTotal: number,
+  categoryTotals: Record<string, number>,
+  tax: number,
+  deliveryFee: number,
+  categoryToAccount: Record<string, { value: string; name: string }>,
+  foodAccount: { value: string; name: string },
+  catchAllAccount: { value: string; name: string },
+): ParsedLine[] => {
+  const lines: ParsedLine[] = []
+
+  // Food COG (the remainder — always first, always the largest)
+  if (foodTotal > 0) {
+    lines.push({
+      amount: round(foodTotal),
+      accountRef: foodAccount,
+      description: 'COG - Food',
+    })
+  }
+
+  // Non-food categories
+  for (const [category, total] of Object.entries(categoryTotals)) {
+    if (total <= 0) continue
+    const accountRef = categoryToAccount[category] || catchAllAccount
+    lines.push({
+      amount: round(total),
+      accountRef,
+      description: `${capitalize(category)}`,
+    })
+  }
+
+  // Delivery fee
+  if (deliveryFee > 0) {
+    const deliveryAccount = categoryToAccount['delivery'] || { value: '83', name: 'Delivery Fee' }
+    lines.push({
+      amount: round(deliveryFee),
+      accountRef: deliveryAccount,
+      description: 'Delivery Fee',
+    })
+  }
+
+  // Sales tax
+  if (tax > 0) {
+    const taxAccount = categoryToAccount['tax'] || { value: '84', name: 'Sales Tax' }
+    lines.push({
+      amount: round(tax),
+      accountRef: taxAccount,
+      description: 'Sales Tax',
+    })
+  }
+
+  return lines
 }
 
-const matchByDescription = (description: string, products: OrderGoodsProduct[]): OrderGoodsProduct | undefined => {
-  const normalized = description.toLowerCase()
-  return products.find(
-    (p) =>
-      p.description.toLowerCase().includes(normalized) ||
-      normalized.includes(p.description.toLowerCase()),
-  )
-}
+const round = (n: number): number => Math.round(n * 100) / 100
+
+const capitalize = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1)

@@ -163,17 +163,15 @@ export interface VendorCacheRecord {
 
 // ─── Extracted Line Item (from Bedrock) ────────────────────────────────────
 
-export interface ExtractedLineItem {
-  upc?: string
+export interface NonFoodItem {
   description: string
-  quantity?: number
-  unitPrice?: number
   amount: number
+  category: string  // 'packaging' | 'janitorial' | 'delivery' | 'other'
 }
 
 export interface ExtractionResult {
-  lineItems: ExtractedLineItem[]
-  subtotal?: number
+  grandTotal: number
   tax?: number
-  total?: number
+  deliveryFee?: number
+  nonFoodItems: NonFoodItem[]
 }

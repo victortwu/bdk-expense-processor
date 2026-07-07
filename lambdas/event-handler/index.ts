@@ -60,7 +60,7 @@ export const handler: SQSHandler = async (event) => {
       const qboVendorRef: QboRef = { value: qboVendor.id, name: qboVendor.displayName }
 
       // ─── 4. Classify Vendor (multi-line or simple) ─────────────────────────
-      const { isMultiLine, products } = await classifyVendor(vendorName)
+      const { isMultiLine } = await classifyVendor(vendorName)
 
       // ─── 5. Fetch Extracted Text (needed for multi-line) ───────────────────
       let extractedText = ''
@@ -76,7 +76,6 @@ export const handler: SQSHandler = async (event) => {
         detail,
         extractedText,
         isMultiLine,
-        products,
         qboVendorId: qboVendor.id,
         qboVendorRef,
         rule: vendorRule,
