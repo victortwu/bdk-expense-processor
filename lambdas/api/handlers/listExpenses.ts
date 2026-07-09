@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb'
 import { respond } from '../../shared/utils/respond'
 import { TABLE_NAME } from '../constants'
 
@@ -12,27 +12,32 @@ export const listExpenses = async (
   const nextToken = event.queryStringParameters?.nextToken
 
   try {
-    const params: Record<string, unknown> = {
-      TableName: TABLE_NAME,
-      IndexName: 'ByStatus',
-      KeyConditionExpression: status
-        ? '#status = :status'
-        : 'begins_with(pk, :pkPrefix)',
-      ExpressionAttributeValues: status
-        ? { ':status': status }
-        : { ':pkPrefix': 'DOC#' },
-      Limit: limit,
-    }
+    const startKey = nextToken
+      ? JSON.parse(Buffer.from(nextToken, 'base64').toString())
+      : undefined
 
-    if (status) {
-      params.ExpressionAttributeNames = { '#status': 'status' }
-    }
-
-    if (nextToken) {
-      params.ExclusiveStartKey = JSON.parse(Buffer.from(nextToken, 'base64').toString())
-    }
-
-    const result = await ddbClient.send(new QueryCommand(params as any))
+    const result = status
+      ? await ddbClient.send(
+          new QueryCommand({
+            TableName: TABLE_NAME,
+            IndexName: 'ByStatus',
+            KeyConditionExpression: '#status = :status',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: { ':status': status },
+            ScanIndexForward: false,
+            Limit: limit,
+            ExclusiveStartKey: startKey,
+          }),
+        )
+      : await ddbClient.send(
+          new ScanCommand({
+            TableName: TABLE_NAME,
+            FilterExpression: 'begins_with(pk, :pkPrefix) AND sk = :sk',
+            ExpressionAttributeValues: { ':pkPrefix': 'DOC#', ':sk': 'state' },
+            Limit: limit,
+            ExclusiveStartKey: startKey,
+          }),
+        )
 
     const response: Record<string, unknown> = {
       items: result.Items || [],

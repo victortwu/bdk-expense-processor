@@ -8,6 +8,7 @@ import { classifyVendor } from './vendors/classifyVendor'
 import { applyRules, getConfig, getVendorRule } from './rules/engine'
 import { attachPdf } from './utils/attachPdf'
 import { emitNotification } from './utils/emitNotification'
+import { getAuthToken } from './utils/getAuthToken'
 import { DocumentProcessedDetail, ExpenseState, QboRef } from './types'
 
 const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
@@ -197,9 +198,13 @@ const submitToQbo = async (
   qboPayload: unknown,
 ): Promise<{ success: boolean; docNumber?: string; purchaseId?: string; error?: string }> => {
   try {
+    const token = await getAuthToken()
     const response = await fetch(`${QBO_SERVICE_URL}/purchases`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify(qboPayload),
     })
 

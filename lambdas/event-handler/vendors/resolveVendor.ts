@@ -1,6 +1,7 @@
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
 import { TABLE_NAME, QBO_SERVICE_URL, VENDOR_CACHE_TTL_HOURS } from '../constants'
 import { QboVendor, VendorCacheRecord } from '../types'
+import { getAuthToken } from '../utils/getAuthToken'
 
 const normalize = (name: string): string =>
   name.toLowerCase().replace(/[^a-z0-9]/g, '')
@@ -74,7 +75,10 @@ const fetchVendorsFromQbo = async (): Promise<QboVendor[]> => {
   if (!QBO_SERVICE_URL) return []
 
   try {
-    const response = await fetch(`${QBO_SERVICE_URL}/vendors`)
+    const token = await getAuthToken()
+    const response = await fetch(`${QBO_SERVICE_URL}/vendors`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
     if (!response.ok) {
       console.error(`Failed to fetch QBO vendors: ${response.status}`)
       return []
