@@ -47,6 +47,10 @@ export class ExpenseEventStack extends cdk.Stack {
       this,
       `/${stageName}/datamgmt/machine-client-secret-string`,
     )
+    const processingKeyArn = ssm.StringParameter.valueForStringParameter(
+      this,
+      `/${stageName}/datamgmt/processing-key-arn`,
+    )
 
     // ─── KMS Key ───────────────────────────────────────────────────────────────
 
@@ -141,6 +145,10 @@ export class ExpenseEventStack extends cdk.Stack {
     processedBucket.grantRead(eventHandlerLambda)
     key.grantDecrypt(eventHandlerLambda)
     key.grantEncrypt(eventHandlerLambda)
+
+    // Grant decrypt on the processing stack's KMS key (for reading from processed bucket)
+    const processingKey = kms.Key.fromKeyArn(this, 'ProcessingKey', processingKeyArn)
+    processingKey.grantDecrypt(eventHandlerLambda)
 
     // Bedrock InvokeModel permission (for line-item extraction)
     eventHandlerLambda.addToRolePolicy(

@@ -34,7 +34,7 @@ export const attachPdf = async (
       body: JSON.stringify({
         fileName,
         contentType: 'application/pdf',
-        fileBytes: Buffer.from(bytes).toString('base64'),
+        content: Buffer.from(bytes).toString('base64'),
       }),
     })
 
