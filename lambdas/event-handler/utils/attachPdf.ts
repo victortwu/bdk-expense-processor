@@ -1,5 +1,6 @@
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
 import { QBO_SERVICE_URL } from '../constants'
+import { getAuthToken } from './getAuthToken'
 
 const s3Client = new S3Client({})
 
@@ -23,9 +24,13 @@ export const attachPdf = async (
     const fileName = key.split('/').pop() || 'receipt.pdf'
 
     // Call QBO Service attachments endpoint
+    const token = await getAuthToken()
     const response = await fetch(`${QBO_SERVICE_URL}/purchases/${purchaseId}/attachments`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
         fileName,
         contentType: 'application/pdf',
