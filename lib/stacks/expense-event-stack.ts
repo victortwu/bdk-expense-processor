@@ -130,7 +130,6 @@ export class ExpenseEventStack extends cdk.Stack {
         TABLE_NAME: table.tableName,
         PROCESSED_BUCKET: processedBucketName,
         QBO_SERVICE_URL: qboServiceUrl,
-        ORDERGOODS_API_URL: stage.ordergoodsApiUrl || '',
         COGNITO_TOKEN_URL: `https://parsely-${stageLower}.auth.${this.region}.amazoncognito.com/oauth2/token`,
         MACHINE_CLIENT_ID: machineClientId,
         MACHINE_CLIENT_SECRET: machineClientSecret,
@@ -151,10 +150,15 @@ export class ExpenseEventStack extends cdk.Stack {
     processingKey.grantDecrypt(eventHandlerLambda)
 
     // Bedrock InvokeModel permission (for line-item extraction)
+    // Cross-region inference profiles (us.*) route to base models (amazon.*) in other regions
     eventHandlerLambda.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['bedrock:InvokeModel'],
-        resources: ['arn:aws:bedrock:*::foundation-model/us.amazon.nova-lite-v1:0'],
+        resources: [
+          'arn:aws:bedrock:*::foundation-model/amazon.nova-lite-v1:0',
+          'arn:aws:bedrock:*::foundation-model/us.amazon.nova-lite-v1:0',
+          `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/us.amazon.nova-lite-v1:0`,
+        ],
       }),
     )
 

@@ -1,6 +1,5 @@
 export interface StageConfig {
   stageName: string
-  ordergoodsApiUrl?: string
   env?: { account: string; region: string }
 }
 

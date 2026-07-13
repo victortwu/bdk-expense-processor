@@ -61,16 +61,17 @@ export const handler: SQSHandler = async (event) => {
       const qboVendorRef: QboRef = { value: qboVendor.id, name: qboVendor.displayName }
 
       // ─── 4. Classify Vendor (multi-line or simple) ─────────────────────────
-      const { isMultiLine } = await classifyVendor(vendorName)
+      const { isMultiLine } = classifyVendor(vendorName)
 
-      // ─── 5. Fetch Extracted Text (needed for multi-line) ───────────────────
+      // ─── 5. Check for explicit vendor rule ─────────────────────────────────
+      const vendorRule = vendorName ? await getVendorRule(ddbClient, vendorName) : null
+
+      // ─── 6. Fetch Extracted Text (needed for catalog_reconcile) ────────────
+      const needsText = isMultiLine || vendorRule?.ruleType === 'catalog_reconcile'
       let extractedText = ''
-      if (isMultiLine && extractedTextUri) {
+      if (needsText && extractedTextUri) {
         extractedText = await fetchExtractedText(extractedTextUri)
       }
-
-      // ─── 6. Check for explicit vendor rule ─────────────────────────────────
-      const vendorRule = vendorName ? await getVendorRule(ddbClient, vendorName) : null
 
       // ─── 7. Apply Rules Engine ─────────────────────────────────────────────
       const ruleResult = await applyRules({

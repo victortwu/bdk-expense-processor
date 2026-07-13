@@ -9,10 +9,16 @@ const DEFAULT_EXTRACTION_PROMPT = `From this receipt/invoice, extract the follow
 1. "grandTotal": the final total amount paid (the single most prominent total on the receipt)
 2. "tax": sales tax amount (0 if not shown)
 3. "deliveryFee": delivery or shipping fee (0 if not shown)
-4. "nonFoodItems": an array of items that are NOT food or ingredients. This includes: cleaning supplies, chemicals, paper products, packaging (containers, bags, wrap, foil), janitorial supplies, equipment, office supplies. For each item provide:
+4. "nonFoodItems": an array of items that are NOT food or ingredients. For each item provide:
    - "description": item name as shown on receipt
    - "amount": the extended price (qty × unit price) for that item
-   - "category": one of "packaging", "janitorial", "other"
+   - "category": one of "packaging", "janitorial", "smallwares", "other"
+
+Category definitions:
+- "packaging": containers, bags, wrap, foil, to-go boxes, paper bags, plastic wrap, cling film
+- "janitorial": cleaning supplies, chemicals, soap, sanitizer, trash bags, mops, brooms
+- "smallwares": kitchen tools, utensils, pans, sheet pans, tongs, spatulas, thermometers, cutting boards, receipt paper, register tape, equipment parts
+- "other": anything non-food that does not fit the above categories
 
 Do NOT include food, beverages, or cooking ingredients in nonFoodItems. Only non-food items.
 
@@ -23,7 +29,8 @@ Format:
   "deliveryFee": 0,
   "nonFoodItems": [
     { "description": "Plastic Wrap 18in", "amount": 12.99, "category": "packaging" },
-    { "description": "Dawn Dish Soap 1gal x3", "amount": 25.47, "category": "janitorial" }
+    { "description": "Dawn Dish Soap 1gal x3", "amount": 25.47, "category": "janitorial" },
+    { "description": "Half Sheet Pan 18x13", "amount": 8.99, "category": "smallwares" }
   ]
 }`
 

@@ -39,10 +39,11 @@ export const getVendorRule = async (
   ddb: DynamoDBDocumentClient,
   vendorName: string,
 ): Promise<VendorRule | null> => {
+  const normalizedName = vendorName.toLowerCase().trim()
   const result = await ddb.send(
     new GetCommand({
       TableName: TABLE_NAME,
-      Key: { pk: `RULE#${vendorName}`, sk: 'v0' },
+      Key: { pk: `RULE#${normalizedName}`, sk: 'v0' },
     }),
   )
   return (result.Item as VendorRule) || null

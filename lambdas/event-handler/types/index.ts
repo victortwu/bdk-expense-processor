@@ -38,15 +38,6 @@ export interface QboPayload {
   privateNote: string
 }
 
-// ─── OrderGoods Types ──────────────────────────────────────────────────────
-
-export interface OrderGoodsProduct {
-  upc?: string
-  description: string
-  category: string
-  vendorName: string
-}
-
 // ─── Rules & Config ────────────────────────────────────────────────────────
 
 export interface VendorRule {
@@ -72,6 +63,7 @@ export interface RuleConfig {
 export interface ConfigDefaults {
   paymentAccountRef: QboRef
   catchAllAccountRef: QboRef
+  categoryToAccount?: Record<string, QboRef>
   matchThreshold: number
   arithmeticTolerance: number
 }
