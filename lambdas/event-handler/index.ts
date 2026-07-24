@@ -38,10 +38,24 @@ export const handler: SQSHandler = async (event) => {
       // ─── 2. Load Config ────────────────────────────────────────────────────
       const config = await getConfig(ddbClient)
 
-      // ─── 3. Resolve Vendor (from QBO vendor cache) ─────────────────────────
-      const qboVendor = vendorName ? await resolveVendor(ddbClient, vendorName) : null
+      // ─── 3. Check for explicit vendor rule ─────────────────────────────────
+      const vendorRule = vendorName ? await getVendorRule(ddbClient, vendorName) : null
 
-      if (!qboVendor) {
+      // ─── 4. Resolve Vendor (rule's qboVendorRef takes priority over cache) ─
+      let qboVendorRef: QboRef | null = null
+
+      if (vendorRule?.qboVendorRef) {
+        // Deterministic: rule explicitly maps to a QBO vendor
+        qboVendorRef = vendorRule.qboVendorRef
+      } else {
+        // Fuzzy: search QBO vendor cache
+        const qboVendor = vendorName ? await resolveVendor(ddbClient, vendorName) : null
+        if (qboVendor) {
+          qboVendorRef = { value: qboVendor.id, name: qboVendor.displayName }
+        }
+      }
+
+      if (!qboVendorRef) {
         // Unknown vendor → needs human to approve/create
         await writeState(documentId, detail, {
           status: 'needs_input',
@@ -58,13 +72,8 @@ export const handler: SQSHandler = async (event) => {
         continue
       }
 
-      const qboVendorRef: QboRef = { value: qboVendor.id, name: qboVendor.displayName }
-
-      // ─── 4. Classify Vendor (multi-line or simple) ─────────────────────────
+      // ─── 5. Classify Vendor (multi-line or simple) ─────────────────────────
       const { isMultiLine } = classifyVendor(vendorName)
-
-      // ─── 5. Check for explicit vendor rule ─────────────────────────────────
-      const vendorRule = vendorName ? await getVendorRule(ddbClient, vendorName) : null
 
       // ─── 6. Fetch Extracted Text (needed for catalog_reconcile) ────────────
       const needsText = isMultiLine || vendorRule?.ruleType === 'catalog_reconcile'
@@ -78,7 +87,7 @@ export const handler: SQSHandler = async (event) => {
         detail,
         extractedText,
         isMultiLine,
-        qboVendorId: qboVendor.id,
+        qboVendorId: qboVendorRef.value,
         qboVendorRef,
         rule: vendorRule,
         config,

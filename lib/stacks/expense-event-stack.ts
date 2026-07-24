@@ -105,7 +105,6 @@ export class ExpenseEventStack extends cdk.Stack {
         detailType: ['DocumentProcessed'],
         detail: {
           documentType: ['financial'],
-          subType: ['invoice', 'receipt'],
         },
       },
       targets: [new eventsTargets.SqsQueue(queue)],

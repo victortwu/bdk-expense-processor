@@ -8,7 +8,7 @@ const DEFAULT_EXTRACTION_PROMPT = `From this receipt/invoice, extract the follow
 
 1. "grandTotal": the final total amount paid (the single most prominent total on the receipt)
 2. "tax": sales tax amount (0 if not shown)
-3. "deliveryFee": delivery or shipping fee (0 if not shown)
+3. "deliveryFee": delivery, shipping, or service fee (0 if not shown)
 4. "nonFoodItems": an array of items that are NOT food or ingredients. For each item provide:
    - "description": item name as shown on receipt
    - "amount": the extended price (qty × unit price) for that item
@@ -21,6 +21,7 @@ Category definitions:
 - "other": anything non-food that does not fit the above categories
 
 Do NOT include food, beverages, or cooking ingredients in nonFoodItems. Only non-food items.
+"Food" includes: any edible product, ingredient, bread, produce, meat, dairy, spices, sauces, oils, beverages, and items purchased for resale or use in food preparation. When in doubt, treat it as food.
 
 Format:
 {

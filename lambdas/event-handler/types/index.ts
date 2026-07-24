@@ -46,6 +46,7 @@ export interface VendorRule {
   ruleType: 'catalog_reconcile' | 'amount_range'
   config: RuleConfig
   defaultExpenseAccountRef?: QboRef
+  qboVendorRef?: QboRef
   autoSubmit?: boolean
 }
 

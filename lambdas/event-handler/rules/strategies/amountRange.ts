@@ -1,5 +1,12 @@
 import { DocumentProcessedDetail, RuleConfig, RuleResult, VendorRule, ConfigDefaults } from '../../types'
 
+const parseAmount = (raw: string | number): number => {
+  if (typeof raw === 'number') return raw
+  const cleaned = raw.replace(/[$,]/g, '')
+  const parsed = parseFloat(cleaned)
+  return isNaN(parsed) ? 0 : parsed
+}
+
 export const amountRange = (
   detail: DocumentProcessedDetail,
   ruleConfig: RuleConfig,
@@ -7,12 +14,21 @@ export const amountRange = (
   config: ConfigDefaults,
 ): RuleResult => {
   const { min, max } = ruleConfig
-  const amount = detail.amounts[0]
+  const rawAmount = detail.amounts[0]
 
-  if (amount === undefined || amount === null) {
+  if (rawAmount === undefined || rawAmount === null) {
     return {
       status: 'needs_input',
       validationErrors: [{ field: 'amounts', reason: 'No amount found in document' }],
+    }
+  }
+
+  const amount = parseAmount(rawAmount)
+
+  if (amount === 0) {
+    return {
+      status: 'needs_input',
+      validationErrors: [{ field: 'amounts', reason: 'Could not parse amount', value: String(rawAmount) }],
     }
   }
 

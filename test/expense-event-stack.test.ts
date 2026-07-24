@@ -81,7 +81,6 @@ describe('ExpenseEventStack', () => {
         'detail-type': ['DocumentProcessed'],
         detail: {
           documentType: ['financial'],
-          subType: ['invoice', 'receipt'],
         },
       },
     })
