@@ -10,6 +10,7 @@ import { attachPdf } from './utils/attachPdf'
 import { emitNotification } from './utils/emitNotification'
 import { getAuthToken } from './utils/getAuthToken'
 import { DocumentProcessedDetail, ExpenseState, QboRef } from './types'
+import { logger } from '../shared/utils/logger'
 
 const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
 const s3Client = new S3Client({})
@@ -21,6 +22,8 @@ export const handler: SQSHandler = async (event) => {
       const detail = eventBridgeEvent.detail as DocumentProcessedDetail
       const { documentId, vendorName, extractedTextUri } = detail
 
+      logger.appendKeys({ documentId, tenantId: detail.tenantId })
+
       // ─── 1. Idempotency Check ──────────────────────────────────────────────
       const existing = await ddbClient.send(
         new GetCommand({ TableName: TABLE_NAME, Key: { pk: `DOC#${documentId}`, sk: 'state' } }),
@@ -29,10 +32,11 @@ export const handler: SQSHandler = async (event) => {
       if (existing.Item) {
         const currentStatus = existing.Item.status
         if (currentStatus === 'submitted' || currentStatus === 'skipped') {
-          console.log(`Document ${documentId} already ${currentStatus}, skipping`)
+          logger.info('Idempotency skip', { currentStatus })
           continue
         }
         // failed or needs_input → re-process below
+        logger.info('Reprocessing prior record', { currentStatus })
       }
 
       // ─── 2. Load Config ────────────────────────────────────────────────────
@@ -47,21 +51,45 @@ export const handler: SQSHandler = async (event) => {
       if (vendorRule?.qboVendorRef) {
         // Deterministic: rule explicitly maps to a QBO vendor
         qboVendorRef = vendorRule.qboVendorRef
+        logger.info('Vendor resolved', {
+          path: 'deterministic',
+          vendorName,
+          qboVendorName: qboVendorRef.name,
+        })
       } else {
         // Fuzzy: search QBO vendor cache
         const qboVendor = vendorName ? await resolveVendor(ddbClient, vendorName) : null
         if (qboVendor) {
           qboVendorRef = { value: qboVendor.id, name: qboVendor.displayName }
+          logger.info('Vendor resolved', {
+            path: 'fuzzy',
+            vendorName,
+            qboVendorName: qboVendorRef.name,
+          })
         }
       }
 
       if (!qboVendorRef) {
         // Unknown vendor → needs human to approve/create
-        await writeState(documentId, detail, {
-          status: 'needs_input',
-          needsInputType: 'new_vendor',
-          validationErrors: [{ field: 'vendorName', reason: `Vendor "${vendorName || 'unknown'}" not found in QBO` }],
-        }, existing.Item)
+        logger.warn('Vendor not found → needs_input', {
+          path: 'not_found',
+          vendorName: vendorName || 'unknown',
+        })
+        await writeState(
+          documentId,
+          detail,
+          {
+            status: 'needs_input',
+            needsInputType: 'new_vendor',
+            validationErrors: [
+              {
+                field: 'vendorName',
+                reason: `Vendor "${vendorName || 'unknown'}" not found in QBO`,
+              },
+            ],
+          },
+          existing.Item,
+        )
 
         await emitNotification({
           type: 'new_vendor',
@@ -74,6 +102,7 @@ export const handler: SQSHandler = async (event) => {
 
       // ─── 5. Classify Vendor (multi-line or simple) ─────────────────────────
       const { isMultiLine } = classifyVendor(vendorName)
+      logger.info('Classification path', { classification: isMultiLine ? 'multi_line' : 'simple' })
 
       // ─── 6. Fetch Extracted Text (needed for catalog_reconcile) ────────────
       const needsText = isMultiLine || vendorRule?.ruleType === 'catalog_reconcile'
@@ -106,6 +135,7 @@ export const handler: SQSHandler = async (event) => {
 
       if (ruleResult.status === 'ready' && ruleResult.qboPayload) {
         const autoSubmit = vendorRule?.autoSubmit !== false
+        logger.info('AutoSubmit decision', { autoSubmit, vendorName })
         if (autoSubmit) {
           const qboResult = await submitToQbo(ruleResult.qboPayload)
 
@@ -114,6 +144,7 @@ export const handler: SQSHandler = async (event) => {
             qboDocNumber = qboResult.docNumber
             qboPurchaseId = qboResult.purchaseId
             submittedAt = now
+            logger.info('QBO submit outcome', { outcome: 'submitted', qboDocNumber, qboPurchaseId })
 
             // ─── 9. Attach PDF (best-effort) ─────────────────────────────
             if (qboPurchaseId) {
@@ -122,8 +153,14 @@ export const handler: SQSHandler = async (event) => {
                 const attachResult = await attachPdf(qboPurchaseId, originalUri)
                 if (attachResult.success) {
                   attachmentUploaded = true
+                  logger.info('Attachment outcome', { outcome: 'uploaded', qboPurchaseId })
                 } else {
                   attachmentFailed = true
+                  logger.warn('Attachment outcome', {
+                    outcome: 'failed',
+                    qboPurchaseId,
+                    reason: attachResult.error,
+                  })
                   await emitNotification({
                     type: 'attachment_failed',
                     documentId,
@@ -137,6 +174,7 @@ export const handler: SQSHandler = async (event) => {
             status = 'failed'
             failedAt = now
             failureReason = qboResult.error
+            logger.warn('QBO submit outcome', { outcome: 'failed', reason: qboResult.error })
 
             await emitNotification({
               type: 'submission_failed',
@@ -150,6 +188,7 @@ export const handler: SQSHandler = async (event) => {
       } else if (ruleResult.status === 'needs_input') {
         // Emit notification for needs_input
         const notifType = ruleResult.needsInputType || 'pick_expense_account'
+        logger.warn('Rule result needs_input', { needsInputType: notifType })
         await emitNotification({
           type: notifType,
           documentId,
@@ -159,24 +198,36 @@ export const handler: SQSHandler = async (event) => {
       }
 
       // ─── 10. Write State ───────────────────────────────────────────────────
-      await writeState(documentId, detail, {
-        status,
-        qboVendorRef,
-        parsedLines: ruleResult.parsedLines,
-        validationErrors: ruleResult.validationErrors,
-        needsInputType: ruleResult.needsInputType,
-        qboDocNumber,
-        qboPurchaseId,
-        submittedAt,
-        failedAt,
-        failureReason,
-        attachmentUploaded,
-        attachmentFailed,
-      }, existing.Item)
+      await writeState(
+        documentId,
+        detail,
+        {
+          status,
+          qboVendorRef,
+          parsedLines: ruleResult.parsedLines,
+          validationErrors: ruleResult.validationErrors,
+          needsInputType: ruleResult.needsInputType,
+          qboDocNumber,
+          qboPurchaseId,
+          submittedAt,
+          failedAt,
+          failureReason,
+          attachmentUploaded,
+          attachmentFailed,
+        },
+        existing.Item,
+      )
 
+      logger.info('Record processed', { status })
     } catch (err) {
-      console.error('Error processing SQS record:', err)
+      const error = err as Error
+      logger.error('Expense record processing failed', {
+        errorName: error.name,
+        errorMessage: error.message,
+      })
       throw err // Let SQS retry
+    } finally {
+      logger.removeKeys(['documentId', 'tenantId'])
     }
   }
 }
@@ -226,6 +277,12 @@ const submitToQbo = async (
 
     if (!response.ok) {
       const errorBody = await response.text()
+      logger.error('QBO submission failed', {
+        errorClass: 'qbo_api',
+        httpStatus: response.status,
+        errorName: 'QboApiError',
+        errorMessage: `QBO API error ${response.status}`,
+      })
       return { success: false, error: `QBO API error ${response.status}: ${errorBody}` }
     }
 
@@ -233,6 +290,11 @@ const submitToQbo = async (
     return { success: true, docNumber: data.docNumber, purchaseId: data.id }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
+    logger.error('QBO submission error', {
+      errorClass: 'qbo_api',
+      errorName: err instanceof Error ? err.name : 'Error',
+      errorMessage: message,
+    })
     return { success: false, error: message }
   }
 }
@@ -261,8 +323,11 @@ const writeState = async (
   const now = new Date().toISOString()
   const isReprocess = !!existingItem
   const attempts = isReprocess
-    ? ((existingItem?.attempts as number) || 0) + (overrides.status === 'submitted' || overrides.status === 'failed' ? 1 : 0)
-    : overrides.status === 'submitted' || overrides.status === 'failed' ? 1 : 0
+    ? ((existingItem?.attempts as number) || 0) +
+      (overrides.status === 'submitted' || overrides.status === 'failed' ? 1 : 0)
+    : overrides.status === 'submitted' || overrides.status === 'failed'
+      ? 1
+      : 0
 
   const state: ExpenseState = {
     pk: `DOC#${documentId}`,
@@ -286,26 +351,29 @@ const writeState = async (
     submittedAt: overrides.submittedAt,
     failedAt: overrides.failedAt,
     failureReason: overrides.failureReason,
-    lastAttempt: overrides.status === 'submitted' || overrides.status === 'failed' ? now : undefined,
+    lastAttempt:
+      overrides.status === 'submitted' || overrides.status === 'failed' ? now : undefined,
     attempts,
     createdAt: (existingItem?.createdAt as string) || now,
     updatedAt: now,
   }
 
-  await ddbClient.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: state,
-      // Idempotency: don't overwrite if someone skipped it
-      ConditionExpression: 'attribute_not_exists(pk) OR #status <> :skipped',
-      ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: { ':skipped': 'skipped' },
-    }),
-  ).catch((err) => {
-    if (err.name === 'ConditionalCheckFailedException') {
-      console.log(`Document ${documentId} was skipped by user, not overwriting`)
-    } else {
-      throw err
-    }
-  })
+  await ddbClient
+    .send(
+      new PutCommand({
+        TableName: TABLE_NAME,
+        Item: state,
+        // Idempotency: don't overwrite if someone skipped it
+        ConditionExpression: 'attribute_not_exists(pk) OR #status <> :skipped',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':skipped': 'skipped' },
+      }),
+    )
+    .catch((err) => {
+      if (err.name === 'ConditionalCheckFailedException') {
+        logger.info('State not overwritten (user-skipped)', { documentId })
+      } else {
+        throw err
+      }
+    })
 }
