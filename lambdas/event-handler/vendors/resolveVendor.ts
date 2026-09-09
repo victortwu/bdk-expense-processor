@@ -2,6 +2,7 @@ import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dyn
 import { TABLE_NAME, QBO_SERVICE_URL, VENDOR_CACHE_TTL_HOURS } from '../constants'
 import { QboVendor, VendorCacheRecord } from '../types'
 import { getAuthToken } from '../utils/getAuthToken'
+import { logger } from '../../shared/utils/logger'
 
 const normalize = (name: string): string =>
   name.toLowerCase().replace(/[^a-z0-9]/g, '')
@@ -11,7 +12,18 @@ export const resolveVendor = async (
   vendorName: string,
 ): Promise<QboVendor | null> => {
   const vendors = await getCachedVendors(ddb)
-  if (!vendors.length) return null
+  if (!vendors.length) {
+    // No vendors available to match against. This is NOT the same as "vendor not
+    // matched" — it usually means the QBO /vendors fetch failed or the cache is
+    // empty (config/connectivity issue). Surface it distinctly so a QBO outage
+    // during UAT doesn't masquerade as a genuine unknown-vendor miss.
+    logger.warn('Vendor resolution: empty QBO vendor list', {
+      errorClass: 'config',
+      reason: 'no_vendors_available',
+      vendorName,
+    })
+    return null
+  }
 
   const normalizedInput = normalize(vendorName)
 
@@ -80,13 +92,22 @@ const fetchVendorsFromQbo = async (): Promise<QboVendor[]> => {
       headers: { Authorization: `Bearer ${token}` },
     })
     if (!response.ok) {
-      console.error(`Failed to fetch QBO vendors: ${response.status}`)
+      logger.error('QBO vendor fetch failed', {
+        errorClass: 'qbo_api',
+        httpStatus: response.status,
+        errorName: 'QboApiError',
+        errorMessage: `GET /vendors returned ${response.status}`,
+      })
       return []
     }
     const data = (await response.json()) as { vendors: QboVendor[] }
     return data.vendors || []
   } catch (err) {
-    console.error('Error fetching QBO vendors:', err)
+    logger.error('QBO vendor fetch error', {
+      errorClass: 'qbo_api',
+      errorName: err instanceof Error ? err.name : 'Error',
+      errorMessage: err instanceof Error ? err.message : 'Unknown error',
+    })
     return []
   }
 }

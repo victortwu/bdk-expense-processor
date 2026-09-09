@@ -70,10 +70,17 @@ export const handler: SQSHandler = async (event) => {
       }
 
       if (!qboVendorRef) {
-        // Unknown vendor → needs human to approve/create
+        // Unknown vendor → needs human to approve/create.
+        // Log the EXTRACTED values alongside the miss so the log alone answers
+        // "did extraction look right, but the vendor just isn't in QBO?" — the
+        // common case for simple date+vendor+amount vendors (e.g. Costco gas)
+        // that rely on an existing QBO vendor profile.
         logger.warn('Vendor not found → needs_input', {
           path: 'not_found',
           vendorName: vendorName || 'unknown',
+          extractedAmount: detail.amounts?.[0],
+          extractedDate: detail.documentDate,
+          extractedSubType: detail.subType,
         })
         await writeState(
           documentId,
