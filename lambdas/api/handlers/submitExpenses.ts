@@ -2,6 +2,7 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { respond } from '../../shared/utils/respond'
 import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
+import { getAuthToken } from '../utils/getAuthToken'
 
 export const submitExpenses = async (
   event: APIGatewayProxyEventV2WithJWTAuthorizer,
@@ -55,9 +56,13 @@ export const submitExpenses = async (
       // Submit to QBO Service
       const now = new Date().toISOString()
       try {
+        const token = await getAuthToken()
         const response = await fetch(`${QBO_SERVICE_URL}/purchases`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
           body: JSON.stringify(expense.qboPayload),
         })
 

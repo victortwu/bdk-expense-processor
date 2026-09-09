@@ -36,6 +36,13 @@ export class ExpenseApiStack extends cdk.Stack {
       this,
       `/${stageName}/datamgmt/machine-client-id`,
     )
+    // Note: Using String (not SecureString) because CloudFormation doesn't support
+    // ssm-secure references in Lambda env vars. This is an internal M2M secret
+    // within the same AWS account — acceptable security posture for Beta.
+    const machineClientSecret = ssm.StringParameter.valueForStringParameter(
+      this,
+      `/${stageName}/datamgmt/machine-client-secret-string`,
+    )
     const qboServiceUrl = ssm.StringParameter.valueForStringParameter(
       this,
       `/${stageName}/datamgmt-qbo/api-url`,
@@ -70,6 +77,9 @@ export class ExpenseApiStack extends cdk.Stack {
       environment: {
         TABLE_NAME: tableName,
         QBO_SERVICE_URL: qboServiceUrl,
+        COGNITO_TOKEN_URL: `https://parsely-${stageName.toLowerCase()}.auth.${this.region}.amazoncognito.com/oauth2/token`,
+        MACHINE_CLIENT_ID: machineClientId,
+        MACHINE_CLIENT_SECRET: machineClientSecret,
       },
       bundling: {
         minify: true,

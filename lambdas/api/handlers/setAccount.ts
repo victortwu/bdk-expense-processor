@@ -2,6 +2,15 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { respond } from '../../shared/utils/respond'
 import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
+import { getAuthToken } from '../utils/getAuthToken'
+
+/** Parses amount strings like "$2,835.09" or "2835.09" into a number. */
+const parseAmount = (raw: string | number | undefined): number => {
+  if (typeof raw === 'number') return raw
+  if (!raw) return 0
+  const parsed = parseFloat(String(raw).replace(/[$,]/g, ''))
+  return isNaN(parsed) ? 0 : parsed
+}
 
 export const setAccount = async (
   event: APIGatewayProxyEventV2WithJWTAuthorizer,
@@ -35,13 +44,40 @@ export const setAccount = async (
     return respond(400, { message: `Expense is not awaiting account selection (current: ${expense.needsInputType})` })
   }
 
-  // Build QBO payload with the selected account
-  const amount = expense.amounts?.[0] || 0
+  // Resolve the payment account from CONFIG#defaults (fall back to the record's
+  // own ref if present). Previously this was hardcoded to a placeholder account,
+  // which caused QBO to reject the purchase.
+  const configResult = await ddbClient.send(
+    new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { pk: 'CONFIG#defaults', sk: 'v0' },
+    }),
+  )
+  const paymentAccountRef = configResult.Item?.paymentAccountRef as
+    | { value: string; name: string }
+    | undefined
+
+  if (!paymentAccountRef?.value) {
+    return respond(500, {
+      message: 'No default payment account configured (CONFIG#defaults.paymentAccountRef missing)',
+    })
+  }
+
+  // Build QBO payload with the selected account. Amounts are stored as raw
+  // extracted strings (e.g. "$1,234.56") — parse before sending to QBO.
+  const amount = parseAmount(expense.amounts?.[0] as string | number | undefined)
+
+  if (amount <= 0) {
+    return respond(400, {
+      message: 'No valid positive amount on this expense to submit',
+    })
+  }
+
   const qboPayload = {
     docNumber: (expense.documentId as string).slice(0, 21),
     txnDate: expense.documentDate,
     paymentType: 'CreditCard',
-    paymentAccountRef: { value: '1', name: 'Default Credit Card' }, // TODO: read from CONFIG#defaults
+    paymentAccountRef,
     entityRef: expense.qboVendorRef,
     lines: [{
       amount,
@@ -51,11 +87,16 @@ export const setAccount = async (
     privateNote: `Manual account selection: ${expense.description || expense.vendorDisplay}`,
   }
 
-  // Submit to QBO
+  // Submit to QBO (authenticated M2M call — the QBO Service /purchases route is
+  // JWT-protected; without a Bearer token this returns 401).
   try {
+    const token = await getAuthToken()
     const response = await fetch(`${QBO_SERVICE_URL}/purchases`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify(qboPayload),
     })
 
