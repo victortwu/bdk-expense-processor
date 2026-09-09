@@ -11,6 +11,10 @@ export const BEDROCK_MODEL_ID = 'us.amazon.nova-lite-v1:0'
 export const BEDROCK_REGION = process.env.AWS_REGION || 'us-west-2'
 
 export const VENDOR_CACHE_TTL_HOURS = 24
+// QBO /vendors fetch resilience: absorb transient cold-start 5xx blips (Run 1 503)
+// without poisoning the batch. 4xx are not retried.
+export const VENDOR_FETCH_MAX_ATTEMPTS = 3
+export const VENDOR_FETCH_BACKOFF_MS = 250
 export const DEFAULT_MATCH_THRESHOLD = 0.9
 export const DEFAULT_ARITHMETIC_TOLERANCE = 0.05
 
