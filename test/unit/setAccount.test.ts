@@ -14,7 +14,7 @@
  */
 import { mockClient } from 'aws-sdk-client-mock'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
 import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 
 process.env.TABLE_NAME = 'test-expense-table'
@@ -76,6 +76,7 @@ describe('setAccount', () => {
       .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
       .resolves({ Item: configDefaults })
     ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({}) // shared submitCharge now writes a CHARGE# marker
 
     let capturedInit: RequestInit | undefined
     mockFetch(async () => {
@@ -108,6 +109,17 @@ describe('setAccount', () => {
     expect(payload.lines[0].amount).toBe(586.37)
     expect(payload.lines[0].accountRef).toEqual({ value: '1150040012', name: 'Auto Repair' })
     expect(payload.entityRef).toEqual({ value: '63', name: 'Burton Auto' })
+
+    // (4) BDK#2 double-book fix: a manual submit now writes the CHARGE# dedup
+    // marker. No invoice number on this expense → fallback amount+date key.
+    const markerPut = ddbMock
+      .commandCalls(PutCommand)
+      .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
+    const marker = markerPut?.args[0].input.Item as Record<string, unknown> | undefined
+    expect(marker).toBeDefined()
+    expect(marker?.pk).toBe('CHARGE#63#AMT#586.37#2025-06-12')
+    expect(marker?.qboPurchaseId).toBe('200')
+    expect(marker?.vendorId).toBe('63')
   })
 
   test('returns 500 when no default payment account is configured', async () => {

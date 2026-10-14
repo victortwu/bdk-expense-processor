@@ -3,6 +3,8 @@ import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-
 import { respond } from '../../shared/utils/respond'
 import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
 import { getAuthToken } from '../utils/getAuthToken'
+import { submitCharge } from '../../shared/booking/submitCharge'
+import { chargeKey, fallbackChargeKey } from '../../event-handler/intent/decideBooking'
 
 /** Parses amount strings like "$2,835.09" or "2835.09" into a number. */
 const parseAmount = (raw: string | number | undefined): number => {
@@ -87,30 +89,45 @@ export const setAccount = async (
     privateNote: `Manual account selection: ${expense.description || expense.vendorDisplay}`,
   }
 
-  // Submit to QBO (authenticated M2M call — the QBO Service /purchases route is
-  // JWT-protected; without a Bearer token this returns 401).
+  // Compute the dedup charge key with the shared rule so a manual submit writes
+  // the SAME marker the automated event-handler would — closing the double-book
+  // hole. Primary (invoice) key when an invoice number is on the expense state,
+  // else the amount+date fallback. OMIT originalUri: the API Lambda has no
+  // processed-bucket grant, so no attachment is attempted (follow-up #7).
+  const vendorId = (expense.qboVendorRef as { value?: string } | undefined)?.value ?? ''
+  const invoiceNumber = expense.invoiceNumber as string | undefined
+  const bookingChargeKey = invoiceNumber
+    ? chargeKey(vendorId, invoiceNumber)
+    : fallbackChargeKey(vendorId, amount, (expense.documentDate as string) || '')
+
+  // Submit to QBO through the shared booking primitive (authenticated POST +
+  // 409-as-success + conditional CHARGE# marker). The API Lambda supplies its
+  // own container-cached getAuthToken and no attachPdf (no PDF grant).
   try {
-    const token = await getAuthToken()
-    const response = await fetch(`${QBO_SERVICE_URL}/purchases`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(qboPayload),
-    })
-
     const now = new Date().toISOString()
+    const result = await submitCharge(
+      {
+        qboPayload,
+        documentId,
+        chargeKey: bookingChargeKey,
+        vendorId,
+        invoiceNumber,
+        amount,
+        documentDate: (expense.documentDate as string) || '',
+      },
+      ddbClient,
+      { getAuthToken, qboServiceUrl: QBO_SERVICE_URL, tableName: TABLE_NAME },
+    )
 
-    if (response.ok || response.status === 409) {
-      const data = (await response.json()) as { id?: string; docNumber?: string; existing?: { id?: string } }
-      const purchaseId = data.id || data.existing?.id
+    if (result.success) {
+      const purchaseId = result.qboPurchaseId
 
       await ddbClient.send(
         new UpdateCommand({
           TableName: TABLE_NAME,
           Key: { pk: `DOC#${documentId}`, sk: 'state' },
-          UpdateExpression: 'SET #status = :status, qboDocNumber = :docNo, qboPurchaseId = :pid, submittedAt = :now, lastAttempt = :now, attempts = attempts + :inc, needsInputType = :nit, validationErrors = :ve, parsedLines = :lines, updatedAt = :now',
+          UpdateExpression:
+            'SET #status = :status, qboDocNumber = :docNo, qboPurchaseId = :pid, submittedAt = :now, lastAttempt = :now, attempts = attempts + :inc, needsInputType = :nit, validationErrors = :ve, parsedLines = :lines, updatedAt = :now',
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: {
             ':status': 'submitted',
@@ -127,24 +144,23 @@ export const setAccount = async (
 
       return respond(200, { message: 'Expense submitted to QBO', purchaseId })
     } else {
-      const errorBody = await response.text()
-
       await ddbClient.send(
         new UpdateCommand({
           TableName: TABLE_NAME,
           Key: { pk: `DOC#${documentId}`, sk: 'state' },
-          UpdateExpression: 'SET #status = :status, failedAt = :now, failureReason = :reason, lastAttempt = :now, attempts = attempts + :inc, updatedAt = :now',
+          UpdateExpression:
+            'SET #status = :status, failedAt = :now, failureReason = :reason, lastAttempt = :now, attempts = attempts + :inc, updatedAt = :now',
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: {
             ':status': 'failed',
             ':now': now,
-            ':reason': `QBO error ${response.status}: ${errorBody}`,
+            ':reason': result.error || 'QBO submission failed',
             ':inc': 1,
           },
         }),
       )
 
-      return respond(502, { message: `QBO submission failed: ${errorBody}` })
+      return respond(502, { message: `QBO submission failed: ${result.error}` })
     }
   } catch (err) {
     console.error('Error submitting expense:', err)

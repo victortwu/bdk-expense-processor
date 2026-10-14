@@ -3,6 +3,34 @@ import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-
 import { respond } from '../../shared/utils/respond'
 import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
 import { getAuthToken } from '../utils/getAuthToken'
+import { submitCharge } from '../../shared/booking/submitCharge'
+import { chargeKey, fallbackChargeKey } from '../../event-handler/intent/decideBooking'
+
+/** Parses amount strings like "$2,835.09" or "2835.09" into a number. */
+const parseAmount = (raw: unknown): number => {
+  if (typeof raw === 'number') return raw
+  if (!raw) return 0
+  const parsed = parseFloat(String(raw).replace(/[$,]/g, ''))
+  return isNaN(parsed) ? 0 : parsed
+}
+
+/**
+ * Compute the dedup charge key for a replayed expense with the shared rule, so
+ * a manual submit writes the SAME marker the automated path would. Primary
+ * (invoice) key when an invoice number is recoverable from the expense state,
+ * else the amount+date fallback derived from the prebuilt QBO payload.
+ */
+const resolveChargeKey = (expense: Record<string, unknown>): { key: string; vendorId: string; invoiceNumber?: string; amount: number; documentDate: string } => {
+  const vendorId = (expense.qboVendorRef as { value?: string } | undefined)?.value ?? ''
+  const invoiceNumber = expense.invoiceNumber as string | undefined
+  const payload = expense.qboPayload as { txnDate?: string; lines?: { amount?: number }[] } | undefined
+  const documentDate = payload?.txnDate ?? (expense.documentDate as string) ?? ''
+  const amount = payload?.lines?.[0]?.amount ?? parseAmount((expense.amounts as unknown[] | undefined)?.[0])
+  const key = invoiceNumber
+    ? chargeKey(vendorId, invoiceNumber)
+    : fallbackChargeKey(vendorId, amount, documentDate)
+  return { key, vendorId, invoiceNumber, amount, documentDate }
+}
 
 export const submitExpenses = async (
   event: APIGatewayProxyEventV2WithJWTAuthorizer,
@@ -53,27 +81,28 @@ export const submitExpenses = async (
         continue
       }
 
-      // Submit to QBO Service
+      // Submit to QBO through the shared booking primitive (authenticated POST +
+      // 409-as-success + conditional CHARGE# marker). OMIT originalUri (no PDF
+      // grant on the API Lambda — follow-up #7).
       const now = new Date().toISOString()
       try {
-        const token = await getAuthToken()
-        const response = await fetch(`${QBO_SERVICE_URL}/purchases`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
+        const ck = resolveChargeKey(expense)
+        const result = await submitCharge(
+          {
+            qboPayload: expense.qboPayload,
+            documentId,
+            chargeKey: ck.key,
+            vendorId: ck.vendorId,
+            invoiceNumber: ck.invoiceNumber,
+            amount: ck.amount,
+            documentDate: ck.documentDate,
           },
-          body: JSON.stringify(expense.qboPayload),
-        })
+          ddbClient,
+          { getAuthToken, qboServiceUrl: QBO_SERVICE_URL, tableName: TABLE_NAME },
+        )
 
-        if (!response.ok) {
-          const errorBody = await response.text()
-          throw new Error(`QBO API error ${response.status}: ${errorBody}`)
-        }
-
-        const qboResult = (await response.json()) as {
-          docNumber?: string
-          purchaseId?: string
+        if (!result.success) {
+          throw new Error(result.error || 'QBO submission failed')
         }
 
         // Update state to submitted
@@ -86,8 +115,8 @@ export const submitExpenses = async (
             ExpressionAttributeNames: { '#status': 'status' },
             ExpressionAttributeValues: {
               ':status': 'submitted',
-              ':docNumber': qboResult.docNumber || '',
-              ':purchaseId': qboResult.purchaseId || '',
+              ':docNumber': result.qboDocNumber || '',
+              ':purchaseId': result.qboPurchaseId || '',
               ':now': now,
               ':inc': 1,
             },

@@ -13,6 +13,7 @@ import { DocumentProcessedDetail, ExpenseState, QboRef } from './types'
 import { classifyIntent } from './intent/classifyIntent'
 import { decideBooking, chargeKey, fallbackChargeKey } from './intent/decideBooking'
 import { BookingOutcome, IntentResult } from './intent/types'
+import { submitCharge } from '../shared/booking/submitCharge'
 import { logger } from '../shared/utils/logger'
 
 const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
@@ -193,55 +194,53 @@ export const handler: SQSHandler = async (event) => {
         const autoSubmit = vendorRule?.autoSubmit !== false
         logger.info('AutoSubmit decision', { autoSubmit, vendorName })
         if (autoSubmit) {
-          const qboResult = await submitToQbo(ruleResult.qboPayload)
+          // The event-handler is the ONE caller that attaches the PDF (it has the
+          // processed-bucket read/decrypt grant). Compute the source URI and pass
+          // it so submitCharge runs the best-effort attach.
+          const originalUri = detail.originalUri || deriveOriginalUri(extractedTextUri) || undefined
+
+          const qboResult = await submitCharge(
+            {
+              qboPayload: ruleResult.qboPayload,
+              documentId,
+              // Preserve the former derivation EXACTLY: the invoice number is the
+              // segment after #INV# in the primary charge key (undefined for a
+              // fallback key) so the marker item shape stays byte-identical.
+              chargeKey: bookingChargeKey,
+              vendorId: qboVendorRef.value,
+              invoiceNumber: bookingChargeKey?.split('#INV#')[1],
+              amount: parseAmount(detail.amounts?.[0] ?? 0),
+              documentDate: detail.documentDate || '',
+              originalUri,
+            },
+            ddbClient,
+            {
+              getAuthToken,
+              qboServiceUrl: QBO_SERVICE_URL,
+              tableName: TABLE_NAME,
+              attachPdf,
+            },
+          )
 
           if (qboResult.success) {
             status = 'submitted'
-            qboDocNumber = qboResult.docNumber
-            qboPurchaseId = qboResult.purchaseId
+            qboDocNumber = qboResult.qboDocNumber
+            qboPurchaseId = qboResult.qboPurchaseId
             submittedAt = now
             logger.info('QBO submit outcome', { outcome: 'submitted', qboDocNumber, qboPurchaseId })
 
-            // ─── 9a. Write dedup marker (CHARGE# item) ───────────────────
-            // Records that this charge is now booked so future lookupCharge
-            // reads (Stage 3) can skip/short-circuit duplicates. Conditional
-            // put so a re-book never clobbers an existing marker.
-            if (qboPurchaseId && bookingChargeKey) {
-              await writeChargeMarker({
-                chargeKey: bookingChargeKey,
-                qboPurchaseId,
+            if (qboResult.attachmentUploaded) {
+              attachmentUploaded = true
+              logger.info('Attachment outcome', { outcome: 'uploaded', qboPurchaseId })
+            } else if (qboResult.attachmentFailed) {
+              attachmentFailed = true
+              logger.warn('Attachment outcome', { outcome: 'failed', qboPurchaseId })
+              await emitNotification({
+                type: 'attachment_failed',
                 documentId,
-                vendorId: qboVendorRef.value,
-                invoiceNumber: bookingChargeKey.split('#INV#')[1],
-                amount: parseAmount(detail.amounts?.[0] ?? 0),
-                documentDate: detail.documentDate || '',
-                bookedAt: now,
+                vendorName,
+                message: 'PDF attachment failed',
               })
-            }
-
-            // ─── 9. Attach PDF (best-effort) ─────────────────────────────
-            if (qboPurchaseId) {
-              const originalUri = detail.originalUri || deriveOriginalUri(extractedTextUri)
-              if (originalUri) {
-                const attachResult = await attachPdf(qboPurchaseId, originalUri)
-                if (attachResult.success) {
-                  attachmentUploaded = true
-                  logger.info('Attachment outcome', { outcome: 'uploaded', qboPurchaseId })
-                } else {
-                  attachmentFailed = true
-                  logger.warn('Attachment outcome', {
-                    outcome: 'failed',
-                    qboPurchaseId,
-                    reason: attachResult.error,
-                  })
-                  await emitNotification({
-                    type: 'attachment_failed',
-                    documentId,
-                    vendorName,
-                    message: `PDF attachment failed: ${attachResult.error}`,
-                  })
-                }
-              }
             }
           } else {
             status = 'failed'
@@ -419,49 +418,6 @@ const mapOutcomeToState = (outcome: BookingOutcome): StateOverrides => {
   }
 }
 
-interface ChargeMarkerInput {
-  chargeKey: string
-  qboPurchaseId: string
-  documentId: string
-  vendorId: string
-  invoiceNumber?: string
-  amount: number
-  documentDate: string
-  bookedAt: string
-}
-
-/**
- * Write the dedup CHARGE# marker item (pk=chargeKey, sk='marker'). Conditional
- * put so a re-book never clobbers an existing marker.
- */
-const writeChargeMarker = async (m: ChargeMarkerInput): Promise<void> => {
-  await ddbClient
-    .send(
-      new PutCommand({
-        TableName: TABLE_NAME,
-        Item: {
-          pk: m.chargeKey,
-          sk: 'marker',
-          qboPurchaseId: m.qboPurchaseId,
-          documentId: m.documentId,
-          vendorId: m.vendorId,
-          invoiceNumber: m.invoiceNumber,
-          amount: m.amount,
-          documentDate: m.documentDate,
-          bookedAt: m.bookedAt,
-        },
-        ConditionExpression: 'attribute_not_exists(pk)',
-      }),
-    )
-    .catch((err) => {
-      if (err.name === 'ConditionalCheckFailedException') {
-        logger.info('Charge marker already exists (not overwritten)', { chargeKey: m.chargeKey })
-      } else {
-        throw err
-      }
-    })
-}
-
 const fetchExtractedText = async (uri: string): Promise<string> => {
   const { bucket, key } = parseS3Uri(uri)
   const response = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
@@ -481,50 +437,6 @@ const deriveOriginalUri = (extractedTextUri: string): string | null => {
   if (!extractedTextUri) return null
   // Replace extracted.txt with original.pdf (convention from Parsely)
   return extractedTextUri.replace('/extracted.txt', '/original.pdf')
-}
-
-const submitToQbo = async (
-  qboPayload: unknown,
-): Promise<{ success: boolean; docNumber?: string; purchaseId?: string; error?: string }> => {
-  try {
-    const token = await getAuthToken()
-    const response = await fetch(`${QBO_SERVICE_URL}/purchases`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(qboPayload),
-    })
-
-    // 409 = duplicate — treat as success
-    if (response.status === 409) {
-      const data = (await response.json()) as { existing?: { id?: string; docNumber?: string } }
-      return { success: true, docNumber: data.existing?.docNumber, purchaseId: data.existing?.id }
-    }
-
-    if (!response.ok) {
-      const errorBody = await response.text()
-      logger.error('QBO submission failed', {
-        errorClass: 'qbo_api',
-        httpStatus: response.status,
-        errorName: 'QboApiError',
-        errorMessage: `QBO API error ${response.status}`,
-      })
-      return { success: false, error: `QBO API error ${response.status}: ${errorBody}` }
-    }
-
-    const data = (await response.json()) as { id?: string; docNumber?: string }
-    return { success: true, docNumber: data.docNumber, purchaseId: data.id }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error'
-    logger.error('QBO submission error', {
-      errorClass: 'qbo_api',
-      errorName: err instanceof Error ? err.name : 'Error',
-      errorMessage: message,
-    })
-    return { success: false, error: message }
-  }
 }
 
 interface StateOverrides {
