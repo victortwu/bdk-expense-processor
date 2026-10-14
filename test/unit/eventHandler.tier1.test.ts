@@ -28,7 +28,23 @@ process.env.MACHINE_CLIENT_ID = 'test-client-id'
 process.env.MACHINE_CLIENT_SECRET = 'test-client-secret'
 
 import { CANONICAL_DOCUMENT_PROCESSED_DETAIL } from '../fixtures/documentProcessedEvent.contract'
+
+// The intent gate (Stage 2) runs for financial docs. Mock the Bedrock call so
+// these orchestration tests stay offline/deterministic — a high-confidence `bill`
+// with an invoice number so decideBooking (real, Stage 3) returns `book` and the
+// existing submit/parse assertions below still hold.
+jest.mock('../../lambdas/event-handler/intent/classifyIntent', () => ({
+  classifyIntent: jest.fn(async () => ({
+    financialIntent: 'bill',
+    invoiceNumber: 'TIER1-INV',
+    referencedInvoiceNumbers: [],
+    intentConfidence: 'high',
+    intentRationale: 'tier1 mock',
+  })),
+}))
+
 import { handler } from '../../lambdas/event-handler/index'
+import { GetObjectCommand } from '@aws-sdk/client-s3'
 
 const ddbMock = mockClient(DynamoDBDocumentClient)
 const ebMock = mockClient(EventBridgeClient)
@@ -113,8 +129,13 @@ beforeEach(() => {
   ebMock.reset()
   ebMock.on(PutEventsCommand).resolves({})
   s3Mock.reset()
-  // attachPdf is best-effort; a rejected S3 send is caught and does not fail the flow.
+  // Any unmapped S3 send rejects (best-effort attachPdf path tolerates it).
   s3Mock.rejects(new Error('s3 not mocked in this test'))
+  // Intent gate (Stage 2) fetches extracted text via S3 GetObject — return text.
+  // (Command-specific handler takes precedence over the catch-all reject above.)
+  s3Mock.on(GetObjectCommand).resolves({
+    Body: { transformToString: async () => 'Invoice #TIER1-INV Status: Open Balance $475.65' },
+  } as never)
 })
 
 describe('event-handler Tier-1 orchestration', () => {

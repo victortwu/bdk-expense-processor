@@ -48,6 +48,13 @@ export interface VendorRule {
   defaultExpenseAccountRef?: QboRef
   qboVendorRef?: QboRef
   autoSubmit?: boolean
+  /**
+   * OPTIONAL per-vendor intent context injected into the Stage-2 classifyIntent
+   * prompt. Describes this vendor's document lifecycle (e.g. "sends an invoice
+   * then a separate autopay receipt"). INTENT context only — never booking
+   * mechanics. If absent, classifyIntent runs without vendor-specific notes.
+   */
+  documentProfile?: string
 }
 
 export interface RuleConfig {

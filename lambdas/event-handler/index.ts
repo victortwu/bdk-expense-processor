@@ -10,6 +10,9 @@ import { attachPdf } from './utils/attachPdf'
 import { emitNotification } from './utils/emitNotification'
 import { getAuthToken } from './utils/getAuthToken'
 import { DocumentProcessedDetail, ExpenseState, QboRef } from './types'
+import { classifyIntent } from './intent/classifyIntent'
+import { decideBooking, chargeKey, fallbackChargeKey } from './intent/decideBooking'
+import { BookingOutcome, IntentResult } from './intent/types'
 import { logger } from '../shared/utils/logger'
 
 const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
@@ -23,6 +26,10 @@ export const handler: SQSHandler = async (event) => {
       const { documentId, vendorName, extractedTextUri } = detail
 
       logger.appendKeys({ documentId, tenantId: detail.tenantId })
+
+      // Set by the intent gate (step 6a) when the outcome is `book`; consumed at
+      // step 9a to write the dedup CHARGE# marker after a successful submit.
+      let bookingChargeKey: string | undefined
 
       // ─── 1. Idempotency Check ──────────────────────────────────────────────
       const existing = await ddbClient.send(
@@ -111,11 +118,53 @@ export const handler: SQSHandler = async (event) => {
       const { isMultiLine } = classifyVendor(vendorName)
       logger.info('Classification path', { classification: isMultiLine ? 'multi_line' : 'simple' })
 
-      // ─── 6. Fetch Extracted Text (needed for catalog_reconcile) ────────────
-      const needsText = isMultiLine || vendorRule?.ruleType === 'catalog_reconcile'
+      // ─── 6. Fetch Extracted Text ───────────────────────────────────────────
+      // Needed by catalog_reconcile AND by the Stage-2 intent classifier (which
+      // runs for every financial doc). Fetch once up front; reuse below.
+      const needsText =
+        isMultiLine ||
+        vendorRule?.ruleType === 'catalog_reconcile' ||
+        detail.documentType === 'financial'
       let extractedText = ''
       if (needsText && extractedTextUri) {
         extractedText = await fetchExtractedText(extractedTextUri)
+      }
+
+      // ─── 6a. INTENT GATE (Stage 2 + Stage 3) ───────────────────────────────
+      // Accrual booking decision for FINANCIAL documents only. Defensive gate:
+      // the EventBridge rule already restricts to documentType==='financial', but
+      // fail safe. If the intent layer resolves to anything other than `book`, we
+      // short-circuit BEFORE applyRules/submit and record a non-booking state.
+      if (detail.documentType === 'financial') {
+        const outcome = await runIntentGate({
+          detail,
+          extractedText,
+          vendorId: qboVendorRef.value,
+          documentProfile: vendorRule?.documentProfile,
+        })
+
+        if (outcome.action !== 'book') {
+          const stateOverride = mapOutcomeToState(outcome)
+          await writeState(documentId, detail, { ...stateOverride, qboVendorRef }, existing.Item)
+          // Only alert a human when the outcome genuinely needs review. A
+          // skip_duplicate / informational outcome is a correct auto-decision —
+          // the structured 'Intent decision' log already covers observability,
+          // so emitting a "pick an account" alert for it would just be noise.
+          if (outcome.action === 'needs_review') {
+            await emitNotification({
+              type: 'pick_expense_account',
+              documentId,
+              vendorName: vendorName || 'unknown',
+              message: stateOverride.failureReason || `Needs review: ${outcome.reason}`,
+            })
+          }
+          logger.info('Record processed', { status: stateOverride.status })
+          continue
+        }
+
+        // action === 'book' → remember the chargeKey so we can write the dedup
+        // marker after a successful QBO submit (step 9a).
+        bookingChargeKey = outcome.chargeKey
       }
 
       // ─── 7. Apply Rules Engine ─────────────────────────────────────────────
@@ -152,6 +201,23 @@ export const handler: SQSHandler = async (event) => {
             qboPurchaseId = qboResult.purchaseId
             submittedAt = now
             logger.info('QBO submit outcome', { outcome: 'submitted', qboDocNumber, qboPurchaseId })
+
+            // ─── 9a. Write dedup marker (CHARGE# item) ───────────────────
+            // Records that this charge is now booked so future lookupCharge
+            // reads (Stage 3) can skip/short-circuit duplicates. Conditional
+            // put so a re-book never clobbers an existing marker.
+            if (qboPurchaseId && bookingChargeKey) {
+              await writeChargeMarker({
+                chargeKey: bookingChargeKey,
+                qboPurchaseId,
+                documentId,
+                vendorId: qboVendorRef.value,
+                invoiceNumber: bookingChargeKey.split('#INV#')[1],
+                amount: parseAmount(detail.amounts?.[0] ?? 0),
+                documentDate: detail.documentDate || '',
+                bookedAt: now,
+              })
+            }
 
             // ─── 9. Attach PDF (best-effort) ─────────────────────────────
             if (qboPurchaseId) {
@@ -240,6 +306,161 @@ export const handler: SQSHandler = async (event) => {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Parse a dollar-formatted string (or number) into a numeric amount. */
+const parseAmount = (raw: string | number | undefined): number => {
+  if (raw === undefined) return 0
+  if (typeof raw === 'number') return raw
+  const parsed = parseFloat(raw.replace(/[$,]/g, ''))
+  return isNaN(parsed) ? 0 : parsed
+}
+
+interface IntentGateParams {
+  detail: DocumentProcessedDetail
+  extractedText: string
+  vendorId: string
+  documentProfile?: string
+}
+
+/**
+ * Stage 2 (classifyIntent, advisory LLM) + Stage 3 (decideBooking, pure).
+ * The dedup READS are done up front here (async) and handed to decideBooking as
+ * an in-memory Map lookup so decideBooking stays pure/sync. Candidate charge keys
+ * = the primary CHARGE#{vendorId}#INV#{invoiceNumber}, every referenced-invoice
+ * key (receipts), and the amount+date fallback key.
+ */
+const runIntentGate = async (params: IntentGateParams): Promise<BookingOutcome> => {
+  const { detail, extractedText, vendorId, documentProfile } = params
+  const amount = parseAmount(detail.amounts?.[0])
+  const documentDate = detail.documentDate || ''
+
+  // Stage 2 — advisory lifecycle classification. Guard missing text (fail safe:
+  // empty text → unknown/low → Stage 3 routes to needs_review).
+  const intent: IntentResult = extractedText
+    ? await classifyIntent(extractedText, documentProfile)
+    : {
+        financialIntent: 'unknown',
+        referencedInvoiceNumbers: [],
+        intentConfidence: 'low',
+        intentRationale: 'missing_extracted_text',
+      }
+
+  // Dedup READS up front. Compute every candidate key, GetItem each, build a Map.
+  const candidateKeys = new Set<string>()
+  if (intent.invoiceNumber) candidateKeys.add(chargeKey(vendorId, intent.invoiceNumber))
+  for (const ref of intent.referencedInvoiceNumbers) candidateKeys.add(chargeKey(vendorId, ref))
+  candidateKeys.add(fallbackChargeKey(vendorId, amount, documentDate))
+
+  const markerMap = new Map<string, { qboPurchaseId: string }>()
+  await Promise.all(
+    [...candidateKeys].map(async (key) => {
+      const res = await ddbClient.send(
+        new GetCommand({ TableName: TABLE_NAME, Key: { pk: key, sk: 'marker' } }),
+      )
+      if (res.Item?.qboPurchaseId) {
+        markerMap.set(key, { qboPurchaseId: String(res.Item.qboPurchaseId) })
+      }
+    }),
+  )
+
+  // Stage 3 — deterministic, pure. SOLE QBO authority.
+  const outcome = decideBooking({
+    intent: intent.financialIntent,
+    intentConfidence: intent.intentConfidence,
+    vendorId,
+    invoiceNumber: intent.invoiceNumber,
+    referencedInvoiceNumbers: intent.referencedInvoiceNumbers,
+    amount,
+    documentDate,
+    lookupCharge: (k) => markerMap.get(k),
+    confidenceFloor: 'medium',
+  })
+
+  // Decision-point log (steering Logging convention). NEVER log document contents.
+  logger.info('Intent decision', {
+    intent: intent.financialIntent,
+    confidence: intent.intentConfidence,
+    action: outcome.action,
+    reason: 'reason' in outcome ? outcome.reason : undefined,
+    invoiceNumber: intent.invoiceNumber,
+    referencedCount: intent.referencedInvoiceNumbers.length,
+  })
+
+  return outcome
+}
+
+/**
+ * Map a non-`book` BookingOutcome to an ExpenseState override. These are the
+ * short-circuit paths — no QBO submit happens.
+ */
+const mapOutcomeToState = (outcome: BookingOutcome): StateOverrides => {
+  switch (outcome.action) {
+    case 'skip_duplicate':
+      return {
+        status: 'skipped',
+        needsInputType: undefined,
+        failureReason: `Duplicate of QBO purchase ${outcome.existingQboPurchaseId}`,
+      }
+    case 'informational':
+      return {
+        status: 'skipped',
+        failureReason: `Informational (${outcome.reason}) — no booking required`,
+      }
+    case 'needs_review':
+      return {
+        status: 'needs_input',
+        needsInputType: 'pick_expense_account',
+        validationErrors: [{ field: 'intent', reason: outcome.reason }],
+        failureReason: `Needs review: ${outcome.reason}`,
+      }
+    default:
+      // `book` is handled inline (never reaches here); fail safe to review.
+      return { status: 'needs_input', needsInputType: 'pick_expense_account' }
+  }
+}
+
+interface ChargeMarkerInput {
+  chargeKey: string
+  qboPurchaseId: string
+  documentId: string
+  vendorId: string
+  invoiceNumber?: string
+  amount: number
+  documentDate: string
+  bookedAt: string
+}
+
+/**
+ * Write the dedup CHARGE# marker item (pk=chargeKey, sk='marker'). Conditional
+ * put so a re-book never clobbers an existing marker.
+ */
+const writeChargeMarker = async (m: ChargeMarkerInput): Promise<void> => {
+  await ddbClient
+    .send(
+      new PutCommand({
+        TableName: TABLE_NAME,
+        Item: {
+          pk: m.chargeKey,
+          sk: 'marker',
+          qboPurchaseId: m.qboPurchaseId,
+          documentId: m.documentId,
+          vendorId: m.vendorId,
+          invoiceNumber: m.invoiceNumber,
+          amount: m.amount,
+          documentDate: m.documentDate,
+          bookedAt: m.bookedAt,
+        },
+        ConditionExpression: 'attribute_not_exists(pk)',
+      }),
+    )
+    .catch((err) => {
+      if (err.name === 'ConditionalCheckFailedException') {
+        logger.info('Charge marker already exists (not overwritten)', { chargeKey: m.chargeKey })
+      } else {
+        throw err
+      }
+    })
+}
 
 const fetchExtractedText = async (uri: string): Promise<string> => {
   const { bucket, key } = parseS3Uri(uri)
