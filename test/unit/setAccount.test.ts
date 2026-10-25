@@ -14,7 +14,13 @@
  */
 import { mockClient } from 'aws-sdk-client-mock'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  UpdateCommand,
+  PutCommand,
+} from '@aws-sdk/lib-dynamodb'
 import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 
 process.env.TABLE_NAME = 'test-expense-table'
@@ -30,6 +36,7 @@ jest.mock('../../lambdas/api/utils/getAuthToken', () => ({
 import { setAccount } from '../../lambdas/api/handlers/setAccount'
 
 const ddbMock = mockClient(DynamoDBDocumentClient)
+const s3Mock = mockClient(S3Client)
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'us-west-2' }))
 
 const DOC_ID = '01TESTDOC0000000000000000'
@@ -63,6 +70,7 @@ const mockFetch = (impl: () => Promise<Response>) => {
 
 beforeEach(() => {
   ddbMock.reset()
+  s3Mock.reset()
   jest.clearAllMocks()
 })
 
@@ -159,5 +167,99 @@ describe('setAccount', () => {
     // assert
     expect(res.statusCode).toBe(400)
     expect(global.fetch).not.toHaveBeenCalled()
+  })
+
+  // ─── BDK #7 — manual-path PDF attachment ─────────────────────────────────
+
+  test('with originalUri on state → attaches PDF best-effort after booking', async () => {
+    // arrange: expense state carries the source PDF uri (persisted by the event-handler)
+    const ORIGINAL_URI = 's3://processed-bucket/documents/t/doc/original.pdf'
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: { ...expenseState, originalUri: ORIGINAL_URI } })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({})
+    s3Mock.on(GetObjectCommand).resolves({
+      Body: { transformToByteArray: async () => new Uint8Array([1, 2, 3]) },
+    } as never)
+    // fetch handles BOTH the /purchases POST and the attachments POST
+    const fetchSpy = jest.fn(async (url: string) => {
+      if (String(url).endsWith('/attachments')) {
+        return new Response('{}', { status: 200 })
+      }
+      return new Response(JSON.stringify({ id: '200', docNumber: 'DOC-200' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    global.fetch = fetchSpy as unknown as typeof fetch
+
+    // act
+    const res = await setAccount(
+      buildEvent({ documentId: DOC_ID, accountRef: { value: '1150040012', name: 'Auto Repair' } }),
+      ddb,
+    )
+
+    // assert: booked + attachment POSTed to the purchase
+    expect(res.statusCode).toBe(200)
+    const attachCall = fetchSpy.mock.calls.find((c) => String(c[0]).endsWith('/attachments'))
+    expect(attachCall).toBeDefined()
+    expect(attachCall?.[0]).toBe('https://qbo-service.test/purchases/200/attachments')
+    // attachment success recorded on the state write
+    const stateUpdate = ddbMock
+      .commandCalls(UpdateCommand)
+      .find((c) => (c.args[0].input as { Key?: { pk?: string } }).Key?.pk === `DOC#${DOC_ID}`)
+    const values = (
+      stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
+    ).ExpressionAttributeValues
+    expect(values?.[':status']).toBe('submitted')
+    expect(values?.[':au']).toBe(true)
+  })
+
+  test('attach failure does NOT fail the booking (submitted + attachmentFailed)', async () => {
+    // arrange: attachments POST returns non-2xx → attach fails, booking must stand
+    const ORIGINAL_URI = 's3://processed-bucket/documents/t/doc/original.pdf'
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: { ...expenseState, originalUri: ORIGINAL_URI } })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({})
+    s3Mock.on(GetObjectCommand).resolves({
+      Body: { transformToByteArray: async () => new Uint8Array([1, 2, 3]) },
+    } as never)
+    const fetchSpy = jest.fn(async (url: string) => {
+      if (String(url).endsWith('/attachments')) {
+        return new Response('attach boom', { status: 500 })
+      }
+      return new Response(JSON.stringify({ id: '200', docNumber: 'DOC-200' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    global.fetch = fetchSpy as unknown as typeof fetch
+
+    // act
+    const res = await setAccount(
+      buildEvent({ documentId: DOC_ID, accountRef: { value: '1150040012', name: 'Auto Repair' } }),
+      ddb,
+    )
+
+    // assert: booking succeeded, attachment flagged failed — never rolled back
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).attachmentFailed).toBe(true)
+    const stateUpdate = ddbMock
+      .commandCalls(UpdateCommand)
+      .find((c) => (c.args[0].input as { Key?: { pk?: string } }).Key?.pk === `DOC#${DOC_ID}`)
+    const values = (
+      stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
+    ).ExpressionAttributeValues
+    expect(values?.[':status']).toBe('submitted')
+    expect(values?.[':af']).toBe(true)
   })
 })

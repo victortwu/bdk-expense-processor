@@ -9,6 +9,7 @@ import { retryExpenses } from './handlers/retryExpenses'
 import { skipExpenses } from './handlers/skipExpenses'
 import { approveVendor } from './handlers/approveVendor'
 import { setAccount } from './handlers/setAccount'
+import { correctAndSubmit } from './handlers/correctAndSubmit'
 import { listRules } from './handlers/listRules'
 import { putRule } from './handlers/putRule'
 import { deleteRule } from './handlers/deleteRule'
@@ -27,8 +28,13 @@ export const handler: APIGatewayProxyHandlerV2WithJWTAuthorizer = async (event) 
     }
 
     // GET /expenses/{documentId}
-    if (method === 'GET' && path.startsWith('/expenses/') && !path.includes('/submit') && !path.includes('/retry') && !path.includes('/skip') && !path.includes('/approve-vendor') && !path.includes('/set-account')) {
+    if (method === 'GET' && path.startsWith('/expenses/') && !path.includes('/submit') && !path.includes('/retry') && !path.includes('/skip') && !path.includes('/approve-vendor') && !path.includes('/set-account') && !path.includes('/correct-and-submit')) {
       return getExpense(event, ddbClient)
+    }
+
+    // POST /expenses/{documentId}/correct-and-submit — Path B: direct correct & submit
+    if (method === 'POST' && path.endsWith('/correct-and-submit')) {
+      return correctAndSubmit(event, ddbClient)
     }
 
     // POST /expenses/submit

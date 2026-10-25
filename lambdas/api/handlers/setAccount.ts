@@ -4,6 +4,7 @@ import { respond } from '../../shared/utils/respond'
 import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
 import { getAuthToken } from '../utils/getAuthToken'
 import { submitCharge } from '../../shared/booking/submitCharge'
+import { attachPdf } from '../utils/attachPdf'
 import { chargeKey, fallbackChargeKey } from '../../event-handler/intent/decideBooking'
 
 /** Parses amount strings like "$2,835.09" or "2835.09" into a number. */
@@ -43,7 +44,9 @@ export const setAccount = async (
   const expense = getResult.Item
 
   if (expense.needsInputType !== 'pick_expense_account') {
-    return respond(400, { message: `Expense is not awaiting account selection (current: ${expense.needsInputType})` })
+    return respond(400, {
+      message: `Expense is not awaiting account selection (current: ${expense.needsInputType})`,
+    })
   }
 
   // Resolve the payment account from CONFIG#defaults (fall back to the record's
@@ -56,8 +59,7 @@ export const setAccount = async (
     }),
   )
   const paymentAccountRef = configResult.Item?.paymentAccountRef as
-    | { value: string; name: string }
-    | undefined
+    { value: string; name: string } | undefined
 
   if (!paymentAccountRef?.value) {
     return respond(500, {
@@ -81,28 +83,34 @@ export const setAccount = async (
     paymentType: 'CreditCard',
     paymentAccountRef,
     entityRef: expense.qboVendorRef,
-    lines: [{
-      amount,
-      accountRef,
-      description: `${expense.vendorDisplay || expense.vendorName} - ${expense.documentDate}`,
-    }],
+    lines: [
+      {
+        amount,
+        accountRef,
+        description: `${expense.vendorDisplay || expense.vendorName} - ${expense.documentDate}`,
+      },
+    ],
     privateNote: `Manual account selection: ${expense.description || expense.vendorDisplay}`,
   }
 
   // Compute the dedup charge key with the shared rule so a manual submit writes
   // the SAME marker the automated event-handler would — closing the double-book
   // hole. Primary (invoice) key when an invoice number is on the expense state,
-  // else the amount+date fallback. OMIT originalUri: the API Lambda has no
-  // processed-bucket grant, so no attachment is attempted (follow-up #7).
+  // else the amount+date fallback.
   const vendorId = (expense.qboVendorRef as { value?: string } | undefined)?.value ?? ''
   const invoiceNumber = expense.invoiceNumber as string | undefined
   const bookingChargeKey = invoiceNumber
     ? chargeKey(vendorId, invoiceNumber)
     : fallbackChargeKey(vendorId, amount, (expense.documentDate as string) || '')
 
+  // Source PDF URI persisted on the DOC# state by the event-handler. When present
+  // the shared primitive best-effort attaches the receipt to the QBO purchase (BDK #7).
+  const originalUri = expense.originalUri as string | undefined
+
   // Submit to QBO through the shared booking primitive (authenticated POST +
-  // 409-as-success + conditional CHARGE# marker). The API Lambda supplies its
-  // own container-cached getAuthToken and no attachPdf (no PDF grant).
+  // 409-as-success + conditional CHARGE# marker + best-effort PDF attach). The
+  // API Lambda supplies its own container-cached getAuthToken + attachPdf (it now
+  // has the processed-bucket read + processing-key decrypt grant — BDK #7).
   try {
     const now = new Date().toISOString()
     const result = await submitCharge(
@@ -114,9 +122,10 @@ export const setAccount = async (
         invoiceNumber,
         amount,
         documentDate: (expense.documentDate as string) || '',
+        originalUri,
       },
       ddbClient,
-      { getAuthToken, qboServiceUrl: QBO_SERVICE_URL, tableName: TABLE_NAME },
+      { getAuthToken, qboServiceUrl: QBO_SERVICE_URL, tableName: TABLE_NAME, attachPdf },
     )
 
     if (result.success) {
@@ -127,7 +136,7 @@ export const setAccount = async (
           TableName: TABLE_NAME,
           Key: { pk: `DOC#${documentId}`, sk: 'state' },
           UpdateExpression:
-            'SET #status = :status, qboDocNumber = :docNo, qboPurchaseId = :pid, submittedAt = :now, lastAttempt = :now, attempts = attempts + :inc, needsInputType = :nit, validationErrors = :ve, parsedLines = :lines, updatedAt = :now',
+            'SET #status = :status, qboDocNumber = :docNo, qboPurchaseId = :pid, submittedAt = :now, lastAttempt = :now, attempts = attempts + :inc, needsInputType = :nit, validationErrors = :ve, parsedLines = :lines, attachmentUploaded = :au, attachmentFailed = :af, updatedAt = :now',
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: {
             ':status': 'submitted',
@@ -138,11 +147,17 @@ export const setAccount = async (
             ':nit': null,
             ':ve': null,
             ':lines': qboPayload.lines,
+            ':au': result.attachmentUploaded ?? null,
+            ':af': result.attachmentFailed ?? null,
           },
         }),
       )
 
-      return respond(200, { message: 'Expense submitted to QBO', purchaseId })
+      return respond(200, {
+        message: 'Expense submitted to QBO',
+        purchaseId,
+        attachmentFailed: result.attachmentFailed,
+      })
     } else {
       await ddbClient.send(
         new UpdateCommand({

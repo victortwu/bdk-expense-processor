@@ -1,5 +1,5 @@
 import * as cdk from 'aws-cdk-lib'
-import { Template } from 'aws-cdk-lib/assertions'
+import { Template, Match } from 'aws-cdk-lib/assertions'
 import { ExpenseApiStack } from '../lib/stacks/expense-api-stack'
 
 const createStack = () => {
@@ -35,7 +35,7 @@ describe('ExpenseApiStack', () => {
     })
   })
 
-  test('creates all 11 API routes', () => {
+  test('creates all 12 API routes', () => {
     const routes = template.findResources('AWS::ApiGatewayV2::Route')
     const routeKeys = Object.values(routes).map(
       (r: Record<string, unknown>) =>
@@ -49,6 +49,7 @@ describe('ExpenseApiStack', () => {
     expect(routeKeys).toContain('POST /expenses/skip')
     expect(routeKeys).toContain('POST /expenses/approve-vendor')
     expect(routeKeys).toContain('POST /expenses/set-account')
+    expect(routeKeys).toContain('POST /expenses/{documentId}/correct-and-submit')
     expect(routeKeys).toContain('GET /rules')
     expect(routeKeys).toContain('PUT /rules/{vendorName}')
     expect(routeKeys).toContain('DELETE /rules/{vendorName}')
@@ -59,5 +60,52 @@ describe('ExpenseApiStack', () => {
     template.hasResourceProperties('AWS::SSM::Parameter', {
       Name: '/Beta/datamgmt-expense-processor/api-url',
     })
+  })
+
+  // ─── BDK #7 — manual-path PDF attachment (env + cross-stack grants) ────────
+
+  test('API Lambda has PROCESSED_BUCKET env', () => {
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      FunctionName: 'Beta-BDK-ExpenseProcessor-Api',
+      Environment: {
+        Variables: Match.objectLike({
+          PROCESSED_BUCKET: Match.anyValue(),
+        }),
+      },
+    })
+  })
+
+  test('API Lambda role gets s3:GetObject on the processed bucket', () => {
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Effect: 'Allow',
+            Action: Match.arrayWith(['s3:GetObject*', 's3:GetBucket*', 's3:List*']),
+          }),
+        ]),
+      },
+    })
+  })
+
+  test('API Lambda role gets kms:Decrypt (processing key, for PDF decrypt)', () => {
+    // Two Decrypt statements exist (expense-processor key + processing key). We
+    // assert at least one Decrypt grant is present (scoped to a key ARN, not '*').
+    const policies = template.findResources('AWS::IAM::Policy')
+    const decryptStatements = Object.values(policies).flatMap((p: Record<string, unknown>) => {
+      const statements = (
+        p as { Properties: { PolicyDocument: { Statement: Array<Record<string, unknown>> } } }
+      ).Properties.PolicyDocument.Statement
+      return statements.filter((s) => {
+        const action = s.Action
+        const actions = Array.isArray(action) ? action : [action]
+        return actions.includes('kms:Decrypt')
+      })
+    })
+    expect(decryptStatements.length).toBeGreaterThanOrEqual(2)
+    // None of the Decrypt grants use a wildcard resource.
+    for (const s of decryptStatements) {
+      expect(s.Resource).not.toBe('*')
+    }
   })
 })

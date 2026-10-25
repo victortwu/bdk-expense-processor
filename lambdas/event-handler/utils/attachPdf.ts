@@ -1,60 +1,15 @@
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
+import { attachPdf as sharedAttachPdf } from '../../shared/booking/attachPdf'
 import { QBO_SERVICE_URL } from '../constants'
 import { getAuthToken } from './getAuthToken'
 
-const s3Client = new S3Client({})
-
+/**
+ * Event-handler PDF attach: thin binding over the shared `attachPdf` primitive
+ * with this Lambda's own QBO Service URL + container-cached getAuthToken. The
+ * public signature is unchanged `(purchaseId, originalUri) => { success, error? }`
+ * so the event-handler's call site + tests are untouched; behaviour is identical.
+ */
 export const attachPdf = async (
   purchaseId: string,
   originalUri: string,
-): Promise<{ success: boolean; error?: string }> => {
-  try {
-    // Download PDF from S3
-    const { bucket, key } = parseS3Uri(originalUri)
-    const s3Response = await s3Client.send(
-      new GetObjectCommand({ Bucket: bucket, Key: key }),
-    )
-
-    const bytes = await s3Response.Body?.transformToByteArray()
-    if (!bytes) {
-      return { success: false, error: 'Empty file body from S3' }
-    }
-
-    // Determine filename from key
-    const fileName = key.split('/').pop() || 'receipt.pdf'
-
-    // Call QBO Service attachments endpoint
-    const token = await getAuthToken()
-    const response = await fetch(`${QBO_SERVICE_URL}/purchases/${purchaseId}/attachments`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        fileName,
-        contentType: 'application/pdf',
-        content: Buffer.from(bytes).toString('base64'),
-      }),
-    })
-
-    if (!response.ok) {
-      const errorBody = await response.text()
-      return { success: false, error: `Attachment upload failed: ${response.status} ${errorBody}` }
-    }
-
-    return { success: true }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error'
-    return { success: false, error: message }
-  }
-}
-
-const parseS3Uri = (uri: string): { bucket: string; key: string } => {
-  const withoutProtocol = uri.replace('s3://', '')
-  const slashIndex = withoutProtocol.indexOf('/')
-  return {
-    bucket: withoutProtocol.slice(0, slashIndex),
-    key: withoutProtocol.slice(slashIndex + 1),
-  }
-}
+): Promise<{ success: boolean; error?: string }> =>
+  sharedAttachPdf(purchaseId, originalUri, { getAuthToken, qboServiceUrl: QBO_SERVICE_URL })

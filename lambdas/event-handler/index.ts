@@ -32,6 +32,12 @@ export const handler: SQSHandler = async (event) => {
       // step 9a to write the dedup CHARGE# marker after a successful submit.
       let bookingChargeKey: string | undefined
 
+      // Source PDF URI for the best-effort attach (step 9a) AND for persistence
+      // onto the DOC# state so MANUAL booking paths (setAccount / correct-and-
+      // submit) can attach the same PDF later (BDK #7). The event-handler is the
+      // only producer of this value; it never changes for a given document.
+      const originalUri = detail.originalUri || deriveOriginalUri(extractedTextUri) || undefined
+
       // ─── 1. Idempotency Check ──────────────────────────────────────────────
       const existing = await ddbClient.send(
         new GetCommand({ TableName: TABLE_NAME, Key: { pk: `DOC#${documentId}`, sk: 'state' } }),
@@ -194,11 +200,6 @@ export const handler: SQSHandler = async (event) => {
         const autoSubmit = vendorRule?.autoSubmit !== false
         logger.info('AutoSubmit decision', { autoSubmit, vendorName })
         if (autoSubmit) {
-          // The event-handler is the ONE caller that attaches the PDF (it has the
-          // processed-bucket read/decrypt grant). Compute the source URI and pass
-          // it so submitCharge runs the best-effort attach.
-          const originalUri = detail.originalUri || deriveOriginalUri(extractedTextUri) || undefined
-
           const qboResult = await submitCharge(
             {
               qboPayload: ruleResult.qboPayload,
@@ -480,6 +481,8 @@ const writeState = async (
     documentDate: detail.documentDate || '',
     amounts: detail.amounts || [],
     description: detail.description,
+    // Persist the source PDF URI so MANUAL booking paths can attach it later (BDK #7).
+    originalUri: detail.originalUri || deriveOriginalUri(detail.extractedTextUri) || undefined,
     parsedLines: overrides.parsedLines as ExpenseState['parsedLines'],
     validationErrors: overrides.validationErrors as ExpenseState['validationErrors'],
     needsInputType: overrides.needsInputType as ExpenseState['needsInputType'],

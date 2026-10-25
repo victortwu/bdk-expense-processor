@@ -91,10 +91,7 @@ export interface ValidationError {
 }
 
 export type NeedsInputType =
-  | 'new_vendor'
-  | 'pick_expense_account'
-  | 'unmatched_items'
-  | 'math_error'
+  'new_vendor' | 'pick_expense_account' | 'unmatched_items' | 'math_error'
 
 export interface RuleResult {
   status: 'ready' | 'needs_input'
@@ -117,6 +114,9 @@ export interface ExpenseState {
   documentDate: string
   amounts: number[]
   description?: string
+  // Source PDF S3 URI (s3://…/original.pdf). Persisted by the event-handler so
+  // manual booking paths can attach the same PDF (BDK #7).
+  originalUri?: string
   parsedLines?: ParsedLine[]
   validationErrors?: ValidationError[]
   needsInputType?: NeedsInputType
@@ -166,7 +166,7 @@ export interface VendorCacheRecord {
 export interface NonFoodItem {
   description: string
   amount: number
-  category: string  // 'packaging' | 'janitorial' | 'delivery' | 'other'
+  category: string // 'packaging' | 'janitorial' | 'delivery' | 'other'
 }
 
 export interface ExtractionResult {
