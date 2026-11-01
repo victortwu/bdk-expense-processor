@@ -150,6 +150,34 @@ describe('submitCharge', () => {
     expect(result.status).toBe('failed')
     expect(result.error).toContain('QBO API error 400')
     expect(result.intuitTid).toBe('tid-abc')
+    expect(result.httpStatus).toBe(400)
+    // Failed booking → NO marker.
+    expect(getMarker()).toBeUndefined()
+  })
+
+  it('401 → failed and surfaces httpStatus 401 (BDK #6 case 5)', async () => {
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValue(
+        makeResponse({ status: 401, body: 'token expired', intuitTid: 'tid-401' }),
+      ) as unknown as typeof fetch
+
+    const result = await submitCharge(
+      {
+        qboPayload: {},
+        documentId: 'DOC-401',
+        chargeKey: 'CHARGE#55#INV#INV-401',
+        vendorId: '55',
+        invoiceNumber: 'INV-401',
+      },
+      ddb,
+      baseDeps(fetchImpl),
+    )
+
+    expect(result.success).toBe(false)
+    expect(result.status).toBe('failed')
+    expect(result.httpStatus).toBe(401)
+    expect(result.intuitTid).toBe('tid-401')
     // Failed booking → NO marker.
     expect(getMarker()).toBeUndefined()
   })

@@ -16,6 +16,13 @@
  *      marker is written (closing the double-book hole, BDK #2).
  *   6. Writes the DOC# state (submitted / failed) and responds.
  *
+ * Error-handling hardening (BDK #6):
+ *   - Case 4 (un-skip): resurrecting a `skipped` record requires explicit
+ *     `override`; otherwise 409 `SKIPPED_REQUIRES_OVERRIDE`.
+ *   - Case 5 (token expiry): a 401 from the QBO Service (surfaced via the
+ *     additive `SubmitChargeResult.httpStatus`) returns an actionable
+ *     `QBO_AUTH_EXPIRED` instead of a generic 502.
+ *
  * Mirrors {@link setAccount} for amount parsing, CONFIG#defaults payment-account
  * resolution, the shared chargeKey/fallbackChargeKey rule, the `submitCharge`
  * deps ({ getAuthToken, qboServiceUrl, tableName, attachPdf } — the API Lambda now
@@ -114,6 +121,20 @@ export const correctAndSubmit = async (
       message: 'Expense changed since it was loaded — reload and retry',
       currentStatus: expense.status,
       currentUpdatedAt: expense.updatedAt,
+    })
+  }
+
+  // ─── Case 4 — un-skip gate ─────────────────────────────────────────────────
+  // The automated SQS path refuses to resurrect a `skipped` record. Path B is an
+  // explicit human act, so we ALLOW skipped → submitted — but only when the human
+  // explicitly confirms via `override`. Without it, reject 409 so the UI can
+  // surface a "book anyway?" confirm (reusing the existing override flag).
+  if (expense.status === 'skipped' && override !== true) {
+    return respond(409, {
+      message:
+        'This expense was skipped — set override to book it anyway',
+      error: 'SKIPPED_REQUIRES_OVERRIDE',
+      currentStatus: expense.status,
     })
   }
 
@@ -286,6 +307,18 @@ export const correctAndSubmit = async (
           },
         }),
       )
+
+      // ─── Case 5 — classify the QBO failure for an actionable response ──────
+      // A 401 from the QBO Service means the QBO OAuth connection has expired;
+      // surface an actionable QBO_AUTH_EXPIRED so the UI can prompt a reconnect
+      // instead of a generic retry. All other QBO failures keep the generic 502.
+      if (result.httpStatus === 401) {
+        return respond(502, {
+          message: 'QBO connection expired — reconnect QBO and try again',
+          error: 'QBO_AUTH_EXPIRED',
+          intuitTid: result.intuitTid,
+        })
+      }
 
       return respond(502, { message: `QBO submission failed: ${result.error}` })
     }

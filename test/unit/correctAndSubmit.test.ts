@@ -264,6 +264,121 @@ describe('correctAndSubmit', () => {
     expect(global.fetch).not.toHaveBeenCalled()
   })
 
+  // ─── BDK #6 — error-handling hardening ───────────────────────────────────
+
+  test('(case 5) QBO 401 → 502 QBO_AUTH_EXPIRED (actionable), state failed', async () => {
+    // arrange
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: expenseState })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    ddbMock.on(GetCommand, { Key: { pk: CHARGE_KEY, sk: 'marker' } }).resolves({}) // no marker
+    ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({})
+    // QBO Service returns 401 (OAuth connection expired) with an intuit_tid header
+    mockFetch(
+      async () =>
+        new Response('token expired', {
+          status: 401,
+          headers: { intuit_tid: 'tid-xyz' },
+        }),
+    )
+
+    // act
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    // assert: actionable auth-expired error, not a generic 502 message
+    expect(res.statusCode).toBe(502)
+    const parsed = JSON.parse(res.body)
+    expect(parsed.error).toBe('QBO_AUTH_EXPIRED')
+    expect(parsed.intuitTid).toBe('tid-xyz')
+    // state → failed (no marker written on a failed booking)
+    const stateUpdate = ddbMock
+      .commandCalls(UpdateCommand)
+      .find((c) => (c.args[0].input as { Key?: { pk?: string } }).Key?.pk === `DOC#${DOC_ID}`)
+    const values = (
+      stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
+    ).ExpressionAttributeValues
+    expect(values?.[':status']).toBe('failed')
+    const markerPut = ddbMock
+      .commandCalls(PutCommand)
+      .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
+    expect(markerPut).toBeUndefined()
+  })
+
+  test('(case 5) non-401 QBO failure → generic 502 (no QBO_AUTH_EXPIRED)', async () => {
+    // arrange
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: expenseState })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    ddbMock.on(GetCommand, { Key: { pk: CHARGE_KEY, sk: 'marker' } }).resolves({})
+    ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({})
+    mockFetch(async () => new Response('server boom', { status: 500 }))
+
+    // act
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    // assert: generic 502, NOT the actionable auth error
+    expect(res.statusCode).toBe(502)
+    expect(JSON.parse(res.body).error).toBeUndefined()
+    expect(JSON.parse(res.body).message).toContain('QBO submission failed')
+  })
+
+  // ─── BDK #6 case 4 — un-skip gate ────────────────────────────────────────
+
+  test('(case 4) skipped record without override → 409 SKIPPED_REQUIRES_OVERRIDE, NO QBO fetch', async () => {
+    // arrange
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: { ...expenseState, status: 'skipped' } })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    mockFetch(okQboResponse)
+
+    // act
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    // assert
+    expect(res.statusCode).toBe(409)
+    expect(JSON.parse(res.body).error).toBe('SKIPPED_REQUIRES_OVERRIDE')
+    expect(global.fetch).not.toHaveBeenCalled()
+  })
+
+  test('(case 4) skipped record WITH override → proceeds and books', async () => {
+    // arrange
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: { ...expenseState, status: 'skipped' } })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    ddbMock.on(GetCommand, { Key: { pk: CHARGE_KEY, sk: 'marker' } }).resolves({})
+    ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({})
+    mockFetch(okQboResponse)
+
+    // act
+    const res = await correctAndSubmit(buildEvent({ ...validBody, override: true }), ddb)
+
+    // assert: un-skip allowed via explicit override → booked
+    expect(res.statusCode).toBe(200)
+    expect(global.fetch).toHaveBeenCalledTimes(1)
+    const stateUpdate = ddbMock
+      .commandCalls(UpdateCommand)
+      .find((c) => (c.args[0].input as { Key?: { pk?: string } }).Key?.pk === `DOC#${DOC_ID}`)
+    const values = (
+      stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
+    ).ExpressionAttributeValues
+    expect(values?.[':status']).toBe('submitted')
+  })
+
   // ─── BDK #7 — manual-path PDF attachment ─────────────────────────────────
 
   test('with originalUri on state → attaches PDF best-effort after booking', async () => {

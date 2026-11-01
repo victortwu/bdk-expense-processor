@@ -35,6 +35,8 @@ interface QboSubmitResult {
   purchaseId?: string
   error?: string
   intuitTid?: string
+  /** HTTP status from the QBO Service response on a non-2xx failure (e.g. 401). */
+  httpStatus?: number
 }
 
 export interface SubmitChargeInput {
@@ -66,6 +68,14 @@ export interface SubmitChargeResult {
   error?: string
   /** `intuit_tid` captured from a QBO error response for triage. */
   intuitTid?: string
+  /**
+   * ADDITIVE (BDK #6, case 5) — the HTTP status of the QBO Service response on a
+   * booking failure. Lets human-facing callers distinguish an auth/token expiry
+   * (401) from a generic QBO error without re-parsing the error string, and
+   * surface an actionable `QBO_AUTH_EXPIRED`. The automated event-handler path
+   * ignores this field (its behaviour and tests are unaffected).
+   */
+  httpStatus?: number
 }
 
 /**
@@ -106,12 +116,14 @@ export const submitCharge = async (
       documentId,
       error: qbo.error,
       intuitTid: qbo.intuitTid,
+      httpStatus: qbo.httpStatus,
     })
     return {
       success: false,
       status: 'failed',
       error: qbo.error,
       intuitTid: qbo.intuitTid,
+      httpStatus: qbo.httpStatus,
     }
   }
 
@@ -214,6 +226,7 @@ const submitToQbo = async (
         success: false,
         error: `QBO API error ${response.status}: ${errorBody}`,
         intuitTid,
+        httpStatus: response.status,
       }
     }
 
