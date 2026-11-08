@@ -143,6 +143,8 @@ export const correctAndSubmit = async (
 
   if (!vendorRef?.value) {
     errors.push({ field: 'vendorRef.value', message: 'Resolved vendor entityRef is required' })
+  } else if (!vendorRef.name) {
+    errors.push({ field: 'vendorRef.name', message: 'Vendor name is required' })
   }
   if (!documentDate) {
     errors.push({ field: 'documentDate', message: 'documentDate is required' })
@@ -265,7 +267,7 @@ export const correctAndSubmit = async (
           TableName: TABLE_NAME,
           Key: { pk: `DOC#${documentId}`, sk: 'state' },
           UpdateExpression:
-            'SET #status = :status, qboDocNumber = :docNo, qboPurchaseId = :pid, submittedAt = :now, lastAttempt = :now, attempts = if_not_exists(attempts, :zero) + :inc, needsInputType = :nit, validationErrors = :ve, parsedLines = :lines, attachmentUploaded = :au, attachmentFailed = :af, updatedAt = :now',
+            'SET #status = :status, qboDocNumber = :docNo, qboPurchaseId = :pid, submittedAt = :now, lastAttempt = :now, attempts = if_not_exists(attempts, :zero) + :inc, needsInputType = :nit, validationErrors = :ve, parsedLines = :lines, attachmentUploaded = :au, attachmentFailed = :af, vendorName = :vendorName, vendorDisplay = :vendorName, qboVendorRef = :vendorRef, documentDate = :documentDate, invoiceNumber = :invoiceNumber, amounts = :amounts, updatedAt = :now REMOVE failureReason, failedAt',
           ExpressionAttributeNames: { '#status': 'status' },
           ExpressionAttributeValues: {
             ':status': 'submitted',
@@ -279,6 +281,12 @@ export const correctAndSubmit = async (
             ':lines': parsedLines,
             ':au': result.attachmentUploaded ?? null,
             ':af': result.attachmentFailed ?? null,
+            // The state must reflect what was actually booked (the human's corrections).
+            ':vendorName': (vendorRef as QboRef).name,
+            ':vendorRef': vendorRef,
+            ':documentDate': documentDate,
+            ':invoiceNumber': effectiveInvoiceNumber ?? null,
+            ':amounts': [totalAmount],
           },
         }),
       )

@@ -165,6 +165,90 @@ describe('correctAndSubmit', () => {
     expect(values?.[':nit']).toBeNull()
   })
 
+  test('success persists the human-corrected vendor, date, invoice and booked total on the state', async () => {
+    // arrange — correct EVERY field away from what the pipeline extracted
+    const correctedKey = 'CHARGE#99#INV#X-1'
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: { ...expenseState, vendorName: 'unknown', vendorDisplay: undefined } })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    ddbMock.on(GetCommand, { Key: { pk: correctedKey, sk: 'marker' } }).resolves({})
+    ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({})
+    mockFetch(okQboResponse)
+    const body = {
+      ...validBody,
+      vendorRef: { value: '99', name: 'Acme Foods' },
+      invoiceNumber: 'X-1',
+      documentDate: '2025-10-01',
+    }
+
+    // act
+    const res = await correctAndSubmit(buildEvent(body), ddb)
+
+    // assert
+    expect(res.statusCode).toBe(200)
+    const stateUpdate = ddbMock
+      .commandCalls(UpdateCommand)
+      .find((c) => (c.args[0].input as { Key?: { pk?: string } }).Key?.pk === `DOC#${DOC_ID}`)
+    const input = stateUpdate?.args[0].input as {
+      UpdateExpression: string
+      ExpressionAttributeValues: Record<string, unknown>
+    }
+    const set = input.UpdateExpression
+    const v = input.ExpressionAttributeValues
+    // each attribute is assigned from the matching value (not just present somewhere)
+    const assigned = (attr: string) => {
+      const key = set.match(new RegExp(`${attr} = (:\\w+)`))?.[1]
+      return key ? v[key] : undefined
+    }
+    expect(assigned('vendorName')).toBe('Acme Foods')
+    expect(assigned('vendorDisplay')).toBe('Acme Foods')
+    expect(assigned('qboVendorRef')).toEqual({ value: '99', name: 'Acme Foods' })
+    expect(assigned('documentDate')).toBe('2025-10-01')
+    expect(assigned('invoiceNumber')).toBe('X-1')
+    expect(assigned('amounts')).toEqual([553.79])
+    // stale failure/skip text must not survive a successful booking
+    expect(set).toMatch(/REMOVE failureReason, failedAt/)
+  })
+
+  test('missing invoice number is stored as null and a missing vendor name is rejected', async () => {
+    // arrange
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: expenseState })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    ddbMock.on(GetCommand, { Key: { sk: 'marker' } }).resolves({}) // fallback-key marker lookup
+    ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({})
+    mockFetch(okQboResponse)
+    const { invoiceNumber: _omit, ...noInvoice } = validBody
+
+    // act
+    const ok = await correctAndSubmit(buildEvent(noInvoice), ddb)
+    const noName = await correctAndSubmit(
+      buildEvent({ ...validBody, vendorRef: { value: '62' } }),
+      ddb,
+    )
+
+    // assert
+    expect(ok.statusCode).toBe(200)
+    const upd = ddbMock
+      .commandCalls(UpdateCommand)
+      .find((c) => (c.args[0].input as { Key?: { pk?: string } }).Key?.pk === `DOC#${DOC_ID}`)
+    const vals = (upd?.args[0].input as { ExpressionAttributeValues: Record<string, unknown> })
+      .ExpressionAttributeValues
+    expect(vals[':invoiceNumber']).toBeNull()
+    expect(noName.statusCode).toBe(400)
+    expect(JSON.parse(noName.body).errors).toEqual([
+      { field: 'vendorRef.name', message: 'Vendor name is required' },
+    ])
+  })
+
   test('(b) pre-POST marker hit, no override → 409, NO QBO fetch', async () => {
     // arrange
     ddbMock
