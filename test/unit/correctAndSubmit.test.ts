@@ -280,10 +280,12 @@ describe('correctAndSubmit', () => {
     // QBO Service returns 401 (OAuth connection expired) with an intuit_tid header
     mockFetch(
       async () =>
-        new Response('token expired', {
-          status: 401,
-          headers: { intuit_tid: 'tid-xyz' },
-        }),
+        new Response(
+          JSON.stringify({
+            error: { code: 'QBO_AUTH_EXPIRED', message: 'QBO connection expired' },
+          }),
+          { status: 401, headers: { intuit_tid: 'tid-xyz' } },
+        ),
     )
 
     // act
@@ -306,6 +308,30 @@ describe('correctAndSubmit', () => {
       .commandCalls(PutCommand)
       .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
     expect(markerPut).toBeUndefined()
+  })
+
+  test('(case 5) bare 401 WITHOUT QBO_AUTH_EXPIRED code (e.g. gateway rejects our token) → generic 502', async () => {
+    // arrange
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: expenseState })
+    ddbMock
+      .on(GetCommand, { Key: { pk: 'CONFIG#defaults', sk: 'v0' } })
+      .resolves({ Item: configDefaults })
+    ddbMock.on(GetCommand, { Key: { pk: CHARGE_KEY, sk: 'marker' } }).resolves({})
+    ddbMock.on(UpdateCommand).resolves({})
+    ddbMock.on(PutCommand).resolves({})
+    mockFetch(
+      async () => new Response(JSON.stringify({ message: 'Unauthorized' }), { status: 401 }),
+    )
+
+    // act
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    // assert
+    expect(res.statusCode).toBe(502)
+    expect(JSON.parse(res.body).error).toBeUndefined()
+    expect(JSON.parse(res.body).message).toContain('QBO submission failed')
   })
 
   test('(case 5) non-401 QBO failure → generic 502 (no QBO_AUTH_EXPIRED)', async () => {

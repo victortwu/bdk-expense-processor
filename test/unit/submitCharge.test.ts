@@ -23,11 +23,7 @@ const QBO_URL = 'https://qbo-service.test'
 const TABLE = 'test-expense-table'
 
 /** Build a fake Response-like object with a controllable status/body/headers. */
-const makeResponse = (opts: {
-  status: number
-  body?: unknown
-  intuitTid?: string
-}): Response => {
+const makeResponse = (opts: { status: number; body?: unknown; intuitTid?: string }): Response => {
   const bodyStr = JSON.stringify(opts.body ?? {})
   return {
     ok: opts.status >= 200 && opts.status < 300,
@@ -35,7 +31,7 @@ const makeResponse = (opts: {
     json: async () => opts.body ?? {},
     text: async () => bodyStr,
     headers: {
-      get: (k: string) => (k === 'intuit_tid' ? opts.intuitTid ?? null : null),
+      get: (k: string) => (k === 'intuit_tid' ? (opts.intuitTid ?? null) : null),
     },
   } as unknown as Response
 }
@@ -67,7 +63,9 @@ describe('submitCharge', () => {
   it('success (2xx) → submitted and writes the CHARGE# marker', async () => {
     const fetchImpl = jest
       .fn()
-      .mockResolvedValue(makeResponse({ status: 200, body: { id: 'P-1', docNumber: 'D-1' } })) as unknown as typeof fetch
+      .mockResolvedValue(
+        makeResponse({ status: 200, body: { id: 'P-1', docNumber: 'D-1' } }),
+      ) as unknown as typeof fetch
 
     const result = await submitCharge(
       {
@@ -83,7 +81,12 @@ describe('submitCharge', () => {
       baseDeps(fetchImpl),
     )
 
-    expect(result).toMatchObject({ success: true, status: 'submitted', qboPurchaseId: 'P-1', qboDocNumber: 'D-1' })
+    expect(result).toMatchObject({
+      success: true,
+      status: 'submitted',
+      qboPurchaseId: 'P-1',
+      qboDocNumber: 'D-1',
+    })
 
     // POSTed to /purchases with Bearer
     const [url, init] = (fetchImpl as jest.Mock).mock.calls[0]
@@ -103,9 +106,11 @@ describe('submitCharge', () => {
   })
 
   it('409 → success surfacing the EXISTING purchase id/docNumber', async () => {
-    const fetchImpl = jest.fn().mockResolvedValue(
-      makeResponse({ status: 409, body: { existing: { id: 'EXISTING-9', docNumber: 'DOC-9' } } }),
-    ) as unknown as typeof fetch
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValue(
+        makeResponse({ status: 409, body: { existing: { id: 'EXISTING-9', docNumber: 'DOC-9' } } }),
+      ) as unknown as typeof fetch
 
     const result = await submitCharge(
       {
@@ -132,7 +137,9 @@ describe('submitCharge', () => {
   it('non-2xx → failed with error + intuitTid captured, no marker', async () => {
     const fetchImpl = jest
       .fn()
-      .mockResolvedValue(makeResponse({ status: 400, body: 'bad request', intuitTid: 'tid-abc' })) as unknown as typeof fetch
+      .mockResolvedValue(
+        makeResponse({ status: 400, body: 'bad request', intuitTid: 'tid-abc' }),
+      ) as unknown as typeof fetch
 
     const result = await submitCharge(
       {
@@ -150,17 +157,18 @@ describe('submitCharge', () => {
     expect(result.status).toBe('failed')
     expect(result.error).toContain('QBO API error 400')
     expect(result.intuitTid).toBe('tid-abc')
-    expect(result.httpStatus).toBe(400)
+    expect(result.errorCode).toBeUndefined()
     // Failed booking → NO marker.
     expect(getMarker()).toBeUndefined()
   })
 
-  it('401 → failed and surfaces httpStatus 401 (BDK #6 case 5)', async () => {
-    const fetchImpl = jest
-      .fn()
-      .mockResolvedValue(
-        makeResponse({ status: 401, body: 'token expired', intuitTid: 'tid-401' }),
-      ) as unknown as typeof fetch
+  it('401 QBO_AUTH_EXPIRED body → failed, surfaces errorCode + body intuitTid', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue(
+      makeResponse({
+        status: 401,
+        body: { error: { code: 'QBO_AUTH_EXPIRED', message: 'expired' }, intuitTid: 'tid-401' },
+      }),
+    ) as unknown as typeof fetch
 
     const result = await submitCharge(
       {
@@ -176,16 +184,36 @@ describe('submitCharge', () => {
 
     expect(result.success).toBe(false)
     expect(result.status).toBe('failed')
-    expect(result.httpStatus).toBe(401)
+    expect(result.errorCode).toBe('QBO_AUTH_EXPIRED')
     expect(result.intuitTid).toBe('tid-401')
     // Failed booking → NO marker.
     expect(getMarker()).toBeUndefined()
   })
 
+  it('non-JSON error body → failed with no errorCode (tolerated)', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      text: async () => '<html>Unauthorized</html>',
+      headers: { get: () => null },
+    }) as unknown as typeof fetch
+
+    const result = await submitCharge(
+      { qboPayload: {}, documentId: 'DOC-X' },
+      ddb,
+      baseDeps(fetchImpl),
+    )
+
+    expect(result.success).toBe(false)
+    expect(result.errorCode).toBeUndefined()
+  })
+
   it('attach failure → attachmentFailed but booking intact (submitted)', async () => {
     const fetchImpl = jest
       .fn()
-      .mockResolvedValue(makeResponse({ status: 200, body: { id: 'P-4', docNumber: 'D-4' } })) as unknown as typeof fetch
+      .mockResolvedValue(
+        makeResponse({ status: 200, body: { id: 'P-4', docNumber: 'D-4' } }),
+      ) as unknown as typeof fetch
 
     const attachPdf = jest.fn().mockResolvedValue({ success: false, error: 's3 denied' })
 
@@ -215,7 +243,9 @@ describe('submitCharge', () => {
   it('no chargeKey → no marker write', async () => {
     const fetchImpl = jest
       .fn()
-      .mockResolvedValue(makeResponse({ status: 200, body: { id: 'P-5', docNumber: 'D-5' } })) as unknown as typeof fetch
+      .mockResolvedValue(
+        makeResponse({ status: 200, body: { id: 'P-5', docNumber: 'D-5' } }),
+      ) as unknown as typeof fetch
 
     const result = await submitCharge(
       { qboPayload: {}, documentId: 'DOC-5' },

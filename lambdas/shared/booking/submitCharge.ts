@@ -35,8 +35,8 @@ interface QboSubmitResult {
   purchaseId?: string
   error?: string
   intuitTid?: string
-  /** HTTP status from the QBO Service response on a non-2xx failure (e.g. 401). */
-  httpStatus?: number
+  /** `error.code` from the QBO Service error body (e.g. QBO_AUTH_EXPIRED), if present. */
+  errorCode?: string
 }
 
 export interface SubmitChargeInput {
@@ -68,14 +68,8 @@ export interface SubmitChargeResult {
   error?: string
   /** `intuit_tid` captured from a QBO error response for triage. */
   intuitTid?: string
-  /**
-   * ADDITIVE (BDK #6, case 5) — the HTTP status of the QBO Service response on a
-   * booking failure. Lets human-facing callers distinguish an auth/token expiry
-   * (401) from a generic QBO error without re-parsing the error string, and
-   * surface an actionable `QBO_AUTH_EXPIRED`. The automated event-handler path
-   * ignores this field (its behaviour and tests are unaffected).
-   */
-  httpStatus?: number
+  /** Typed `error.code` from the QBO Service body (e.g. `QBO_AUTH_EXPIRED`). */
+  errorCode?: string
 }
 
 /**
@@ -92,7 +86,10 @@ export interface SubmitChargeDeps {
   /** DynamoDB table name for the dedup marker write. */
   tableName: string
   /** Best-effort PDF attach. Omitted by callers that cannot fetch the PDF. */
-  attachPdf?: (purchaseId: string, originalUri: string) => Promise<{ success: boolean; error?: string }>
+  attachPdf?: (
+    purchaseId: string,
+    originalUri: string,
+  ) => Promise<{ success: boolean; error?: string }>
   /** Injectable fetch (defaults to the global). */
   fetchImpl?: typeof fetch
 }
@@ -116,14 +113,14 @@ export const submitCharge = async (
       documentId,
       error: qbo.error,
       intuitTid: qbo.intuitTid,
-      httpStatus: qbo.httpStatus,
+      errorCode: qbo.errorCode,
     })
     return {
       success: false,
       status: 'failed',
       error: qbo.error,
       intuitTid: qbo.intuitTid,
-      httpStatus: qbo.httpStatus,
+      errorCode: qbo.errorCode,
     }
   }
 
@@ -214,19 +211,21 @@ const submitToQbo = async (
 
     if (!response.ok) {
       const errorBody = await response.text()
-      const intuitTid = extractIntuitTid(response)
+      const { errorCode, bodyTid } = parseErrorBody(errorBody)
+      const intuitTid = extractIntuitTid(response) ?? bodyTid
       logger.error('QBO submission failed', {
         errorClass: 'qbo_api',
         httpStatus: response.status,
         errorName: 'QboApiError',
         errorMessage: `QBO API error ${response.status}`,
         intuitTid,
+        errorCode,
       })
       return {
         success: false,
         error: `QBO API error ${response.status}: ${errorBody}`,
         intuitTid,
-        httpStatus: response.status,
+        errorCode,
       }
     }
 
@@ -244,9 +243,27 @@ const submitToQbo = async (
 }
 
 /** Pull the `intuit_tid` triage id from the QBO error response headers (if any). */
-const extractIntuitTid = (response: { headers?: { get?: (k: string) => string | null } }): string | undefined => {
+const extractIntuitTid = (response: {
+  headers?: { get?: (k: string) => string | null }
+}): string | undefined => {
   const tid = response.headers?.get?.('intuit_tid') ?? undefined
   return tid ?? undefined
+}
+
+/**
+ * Parse `{ error: { code }, intuitTid }` from a QBO Service error body.
+ * Tolerates non-JSON / unexpected shapes (returns undefined fields).
+ */
+const parseErrorBody = (raw: string): { errorCode?: string; bodyTid?: string } => {
+  try {
+    const parsed = JSON.parse(raw) as { error?: { code?: unknown }; intuitTid?: unknown }
+    return {
+      errorCode: typeof parsed?.error?.code === 'string' ? parsed.error.code : undefined,
+      bodyTid: typeof parsed?.intuitTid === 'string' ? parsed.intuitTid : undefined,
+    }
+  } catch {
+    return {}
+  }
 }
 
 // ─── Internal: dedup marker ─────────────────────────────────────────────────

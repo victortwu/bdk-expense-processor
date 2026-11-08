@@ -19,8 +19,8 @@
  * Error-handling hardening (BDK #6):
  *   - Case 4 (un-skip): resurrecting a `skipped` record requires explicit
  *     `override`; otherwise 409 `SKIPPED_REQUIRES_OVERRIDE`.
- *   - Case 5 (token expiry): a 401 from the QBO Service (surfaced via the
- *     additive `SubmitChargeResult.httpStatus`) returns an actionable
+ *   - Case 5 (token expiry): a QBO Service error body with code `QBO_AUTH_EXPIRED`
+ *     (surfaced via the additive `SubmitChargeResult.errorCode`) returns an actionable
  *     `QBO_AUTH_EXPIRED` instead of a generic 502.
  *
  * Mirrors {@link setAccount} for amount parsing, CONFIG#defaults payment-account
@@ -309,10 +309,11 @@ export const correctAndSubmit = async (
       )
 
       // ─── Case 5 — classify the QBO failure for an actionable response ──────
-      // A 401 from the QBO Service means the QBO OAuth connection has expired;
-      // surface an actionable QBO_AUTH_EXPIRED so the UI can prompt a reconnect
+      // The QBO Service signals an expired QBO OAuth connection with the typed code
+      // QBO_AUTH_EXPIRED (a bare 401 is ambiguous — our own M2M token can be rejected
+      // too); surface an actionable QBO_AUTH_EXPIRED so the UI can prompt a reconnect
       // instead of a generic retry. All other QBO failures keep the generic 502.
-      if (result.httpStatus === 401) {
+      if (result.errorCode === 'QBO_AUTH_EXPIRED') {
         return respond(502, {
           message: 'QBO connection expired — reconnect QBO and try again',
           error: 'QBO_AUTH_EXPIRED',
