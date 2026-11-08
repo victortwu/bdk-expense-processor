@@ -18,11 +18,6 @@ export interface DocumentProcessedDetail {
 
 // ─── QBO Types ─────────────────────────────────────────────────────────────
 
-export interface QboVendor {
-  id: string
-  displayName: string
-}
-
 export interface QboRef {
   value: string
   name: string
@@ -150,15 +145,6 @@ export interface NotificationDetail {
   vendorName: string
   message: string
   metadata?: Record<string, unknown>
-}
-
-// ─── Vendor Cache ──────────────────────────────────────────────────────────
-
-export interface VendorCacheRecord {
-  pk: string
-  sk: string
-  vendors: QboVendor[]
-  refreshedAt: string
 }
 
 // ─── Extracted Line Item (from Bedrock) ────────────────────────────────────

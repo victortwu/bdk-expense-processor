@@ -1,4 +1,4 @@
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
 import {
   TABLE_NAME,
   QBO_SERVICE_URL,
@@ -6,12 +6,12 @@ import {
   VENDOR_FETCH_MAX_ATTEMPTS,
   VENDOR_FETCH_BACKOFF_MS,
 } from '../constants'
-import { QboVendor, VendorCacheRecord } from '../types'
+import { QboVendor } from '../../shared/qbo/types'
 import { getAuthToken } from '../utils/getAuthToken'
 import { logger } from '../../shared/utils/logger'
+import { FetchListResult, getCachedList, QBO_VENDORS_CACHE } from '../../shared/qbo/listCache'
 
-const normalize = (name: string): string =>
-  name.toLowerCase().replace(/[^a-z0-9]/g, '')
+const normalize = (name: string): string => name.toLowerCase().replace(/[^a-z0-9]/g, '')
 
 export const resolveVendor = async (
   ddb: DynamoDBDocumentClient,
@@ -49,72 +49,20 @@ export const resolveVendor = async (
 }
 
 const getCachedVendors = async (ddb: DynamoDBDocumentClient): Promise<QboVendor[]> => {
-  // Try cache first
-  const cacheResult = await ddb.send(
-    new GetCommand({
-      TableName: TABLE_NAME,
-      Key: { pk: 'CACHE#qbo-vendors', sk: 'v0' },
-    }),
-  )
-
-  const cache = cacheResult.Item as VendorCacheRecord | undefined
-
-  if (cache && !isCacheStale(cache.refreshedAt)) {
-    return cache.vendors
-  }
-
-  // Cache miss or stale — refresh from QBO Service.
-  const fetchResult = await fetchVendorsFromQbo()
-
-  if (!fetchResult.ok) {
-    // The QBO /vendors fetch FAILED (network/5xx/etc). Do NOT write this into the
-    // cache — caching an empty list here would poison every subsequent lookup in
-    // the batch with a fresh-but-empty cache (a single transient 503 cascading
-    // into many false "vendor not found" results). Instead, fall back to whatever
-    // we already have cached (even if stale) so the deterministic data survives a
-    // blip, and let the NEXT lookup retry the fetch.
-    logger.warn('QBO vendor fetch failed — preserving existing cache, will retry next lookup', {
-      errorClass: 'qbo_api',
-      reason: 'fetch_failed_cache_preserved',
-      cachedVendorCount: cache?.vendors.length ?? 0,
-      cacheStale: cache ? isCacheStale(cache.refreshedAt) : true,
-    })
-    return cache?.vendors ?? []
-  }
-
-  // Fetch succeeded — safe to (re)write the cache, even if the list is genuinely
-  // empty (a QBO account with zero vendors is a legitimate, cacheable state).
-  await ddb.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: {
-        pk: 'CACHE#qbo-vendors',
-        sk: 'v0',
-        vendors: fetchResult.vendors,
-        refreshedAt: new Date().toISOString(),
-      },
-    }),
-  )
-
-  return fetchResult.vendors
+  const cached = await getCachedList<QboVendor>({
+    ddb,
+    tableName: TABLE_NAME,
+    ...QBO_VENDORS_CACHE,
+    ttlMs: VENDOR_CACHE_TTL_HOURS * 60 * 60 * 1000,
+    fetchList: fetchVendorsFromQbo,
+  })
+  return cached?.items ?? []
 }
 
-const isCacheStale = (refreshedAt: string): boolean => {
-  const refreshedTime = new Date(refreshedAt).getTime()
-  const now = Date.now()
-  const ttlMs = VENDOR_CACHE_TTL_HOURS * 60 * 60 * 1000
-  return now - refreshedTime > ttlMs
-}
-
-// Result of a QBO /vendors fetch. `ok:false` means the fetch itself failed
-// (network / non-2xx / missing config) — distinct from a successful fetch that
-// legitimately returns zero vendors (`ok:true, vendors:[]`). Only a successful
-// fetch may be written to the cache.
-type VendorFetchResult =
-  | { ok: true; vendors: QboVendor[] }
-  | { ok: false }
-
-const fetchVendorsFromQbo = async (): Promise<VendorFetchResult> => {
+// `ok:false` means the fetch itself failed (network / non-2xx / missing config) — distinct
+// from a successful fetch that legitimately returns zero vendors. Only a successful fetch
+// may be written to the cache.
+const fetchVendorsFromQbo = async (): Promise<FetchListResult<QboVendor>> => {
   if (!QBO_SERVICE_URL) {
     logger.error('QBO vendor fetch skipped — QBO_SERVICE_URL not configured', {
       errorClass: 'config',
@@ -136,14 +84,23 @@ const fetchVendorsFromQbo = async (): Promise<VendorFetchResult> => {
 
       if (response.ok) {
         const data = (await response.json()) as { vendors?: QboVendor[] }
-        const vendors = data.vendors ?? []
+        if (!Array.isArray(data.vendors)) {
+          // Not transient — retrying won't fix a malformed body, and caching it as [] would poison the cache.
+          logger.warn('QBO vendor fetch returned malformed body', {
+            errorClass: 'qbo_api',
+            reason: 'malformed_vendor_response',
+            attempt,
+          })
+          return { ok: false }
+        }
+        const vendors = data.vendors
         logger.info('QBO vendor fetch succeeded', {
           operation: 'fetchVendorsFromQbo',
           outcome: 'ok',
           vendorCount: vendors.length,
           attempt,
         })
-        return { ok: true, vendors }
+        return { ok: true, items: vendors }
       }
 
       const transient = response.status >= 500

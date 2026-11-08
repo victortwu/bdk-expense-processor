@@ -12,3 +12,6 @@ export const PROCESSED_BUCKET = process.env.PROCESSED_BUCKET!
 export const COGNITO_TOKEN_URL = process.env.COGNITO_TOKEN_URL!
 export const MACHINE_CLIENT_ID = process.env.MACHINE_CLIENT_ID!
 export const MACHINE_CLIENT_SECRET = process.env.MACHINE_CLIENT_SECRET!
+
+// TTL for the QBO vendor/account lookup caches served by GET /qbo/*.
+export const QBO_LIST_CACHE_TTL_MS = 60 * 60 * 1000

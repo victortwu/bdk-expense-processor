@@ -211,6 +211,16 @@ export class ExpenseApiStack extends cdk.Stack {
       authorizer: jwtAuthorizer,
     })
 
+    // QBO lookup routes (vendor / account dropdowns)
+    for (const path of ['/qbo/vendors', '/qbo/accounts']) {
+      httpApi.addRoutes({
+        path,
+        methods: [apigwv2.HttpMethod.GET],
+        integration: apiIntegration,
+        authorizer: jwtAuthorizer,
+      })
+    }
+
     // Stats route
     httpApi.addRoutes({
       path: '/stats',

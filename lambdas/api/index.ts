@@ -14,6 +14,7 @@ import { listRules } from './handlers/listRules'
 import { putRule } from './handlers/putRule'
 import { deleteRule } from './handlers/deleteRule'
 import { getStats } from './handlers/getStats'
+import { listQboVendors, listQboAccounts } from './handlers/listQboLookups'
 
 const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
 
@@ -80,6 +81,14 @@ export const handler: APIGatewayProxyHandlerV2WithJWTAuthorizer = async (event) 
     // GET /stats
     if (method === 'GET' && path === '/stats') {
       return getStats(event, ddbClient)
+    }
+
+    // GET /qbo/vendors, GET /qbo/accounts
+    if (method === 'GET' && path === '/qbo/vendors') {
+      return listQboVendors(event, ddbClient)
+    }
+    if (method === 'GET' && path === '/qbo/accounts') {
+      return listQboAccounts(event, ddbClient)
     }
 
     return respond(404, { message: `Route not found: ${method} ${path}` })

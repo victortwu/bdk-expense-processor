@@ -8,7 +8,7 @@
  * "fresh-but-empty" cache and short-circuited to needs_input:new_vendor — one
  * blip cascading into many false negatives.
  *
- * FIX: fetchVendorsFromQbo() now returns a discriminated result ({ok:true,vendors}
+ * FIX: fetchVendorsFromQbo() now returns a discriminated result ({ok:true,items}
  * | {ok:false}). getCachedVendors() ONLY writes the cache on a successful fetch;
  * on failure it preserves the existing (even stale) cache and lets the next lookup
  * retry.
@@ -42,9 +42,7 @@ const TWO_DAYS_AGO = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString()
 const cachePut = () =>
   ddbMock
     .commandCalls(PutCommand)
-    .filter(
-      (c) => (c.args[0].input as { Item?: { pk?: string } }).Item?.pk === 'CACHE#qbo-vendors',
-    )
+    .filter((c) => (c.args[0].input as { Item?: { pk?: string } }).Item?.pk === 'CACHE#qbo-vendors')
 
 const mockFetch = (impl: () => Promise<Response>) => {
   global.fetch = jest.fn(impl) as unknown as typeof fetch
@@ -194,6 +192,40 @@ describe('resolveVendor vendor cache', () => {
     // assert: exactly one attempt (no retry), null result, no cache write
     expect(call).toBe(1)
     expect(result).toBeNull()
+    expect(cachePut()).toHaveLength(0)
+  })
+
+  test('malformed 200 (no vendors array) is not retried, not cached, and stale cache is served', async () => {
+    // arrange: stale cache present; QBO returns 200 with `{}`
+    ddbMock.on(GetCommand).resolves({
+      Item: {
+        pk: 'CACHE#qbo-vendors',
+        sk: 'v0',
+        refreshedAt: TWO_DAYS_AGO,
+        vendors: [{ id: '62', displayName: 'West Coast Pita & Foods, Inc' }],
+      },
+    })
+    let call = 0
+    mockFetch(async () => {
+      call++
+      return new Response('{}', { status: 200 })
+    })
+
+    // act
+    const result = await resolveVendor(ddb, 'West Coast Pita')
+
+    // assert: single attempt, stale cache served, no write
+    expect(call).toBe(1)
+    expect(result).toEqual({ id: '62', displayName: 'West Coast Pita & Foods, Inc' })
+    expect(cachePut()).toHaveLength(0)
+  })
+
+  test('malformed 200 with no existing cache does not throw or write the cache', async () => {
+    ddbMock.on(GetCommand).resolves({ Item: undefined })
+    ddbMock.on(PutCommand).resolves({})
+    mockFetch(async () => new Response('{}', { status: 200 }))
+
+    await expect(resolveVendor(ddb, 'Franz Bakery')).resolves.toBeNull()
     expect(cachePut()).toHaveLength(0)
   })
 })

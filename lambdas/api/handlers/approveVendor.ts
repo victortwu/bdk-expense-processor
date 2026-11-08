@@ -3,11 +3,8 @@ import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-
 import { respond } from '../../shared/utils/respond'
 import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
 import { getAuthToken } from '../utils/getAuthToken'
-
-interface QboVendor {
-  id: string
-  displayName: string
-}
+import { QBO_VENDORS_CACHE } from '../../shared/qbo/listCache'
+import { QboVendor } from '../../shared/qbo/types'
 
 export const approveVendor = async (
   event: APIGatewayProxyEventV2WithJWTAuthorizer,
@@ -95,7 +92,7 @@ export const approveVendor = async (
       .send(
         new UpdateCommand({
           TableName: TABLE_NAME,
-          Key: { pk: 'CACHE#qbo-vendors', sk: 'v0' },
+          Key: QBO_VENDORS_CACHE.key,
           UpdateExpression: 'SET refreshedAt = :stale',
           ExpressionAttributeValues: { ':stale': '2000-01-01T00:00:00.000Z' },
         }),
