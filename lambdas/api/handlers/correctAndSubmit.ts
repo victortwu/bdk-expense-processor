@@ -3,59 +3,32 @@
  * ────────────────────────────────────────────────────────────────────────────
  * `POST /expenses/{documentId}/correct-and-submit`
  *
- * Lets a HUMAN book a corrected expense DIRECTLY to QuickBooks Online, bypassing
- * the automated intent gate — the human is the booking authority. The request
- * carries human-edited fields (vendorRef, lines[], documentDate, memo, …) and the
- * handler:
+ * Lets a HUMAN book a corrected expense DIRECTLY to QuickBooks Online, bypassing the
+ * automated intent gate — the human is the booking authority. The handler loads the
+ * expense (404), gates skipped/submitted rebooks behind `override` (409), validates the
+ * edited payload BEFORE any QBO call (400 w/ field errors), builds a multi-line payload and
+ * books it through the shared `bookExpense` path (marker pre-check 409 unless `override`,
+ * CHARGE# marker, PDF attach, DOC# state mirroring exactly what was booked).
  *
- *   1. Loads the DOC#{id}/state item (404 if absent).
- *   2. Validates the edited payload BEFORE any QBO call (400 w/ field errors).
- *   3. Pre-POST dedup check against the CHARGE# marker (409 unless `override`).
- *   4. Builds a MULTI-LINE QBO payload from the edited lines.
- *   5. Books via the shared `submitCharge` primitive — so the CHARGE# dedup
- *      marker is written (closing the double-book hole, BDK #2).
- *   6. Writes the DOC# state (submitted / failed) and responds.
- *
- * Error-handling hardening (BDK #6):
- *   - Case 4 (un-skip): resurrecting a `skipped` record requires explicit
- *     `override`; otherwise 409 `SKIPPED_REQUIRES_OVERRIDE`.
- *   - Case 5 (token expiry): a QBO Service error body with code `QBO_AUTH_EXPIRED`
- *     (surfaced via the additive `SubmitChargeResult.errorCode`) returns an actionable
- *     `QBO_AUTH_EXPIRED` instead of a generic 502.
- *
- * Mirrors {@link setAccount} for amount parsing, CONFIG#defaults payment-account
- * resolution, the shared chargeKey/fallbackChargeKey rule, the `submitCharge`
- * deps ({ getAuthToken, qboServiceUrl, tableName, attachPdf } — the API Lambda now
- * has the processed-bucket read + processing-key decrypt grant, BDK #7) and the
- * submitted/failed state
- * writes. Difference: this path supports arbitrary multi-line input and bypasses
- * the `needsInputType` gate.
+ * A QBO error body with code `QBO_AUTH_EXPIRED` returns an actionable `QBO_AUTH_EXPIRED`
+ * instead of a generic 502 (BDK #6).
  */
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
-import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
-import { getAuthToken } from '../utils/getAuthToken'
-import { submitCharge } from '../../shared/booking/submitCharge'
-import { attachPdf } from '../utils/attachPdf'
-import { chargeKey, fallbackChargeKey } from '../../event-handler/intent/decideBooking'
-
-/** Parses amount strings like "$2,835.09" or "2835.09" into a number. */
-const parseAmount = (raw: string | number | undefined): number => {
-  if (typeof raw === 'number') return raw
-  if (!raw) return 0
-  const parsed = parseFloat(String(raw).replace(/[$,]/g, ''))
-  return isNaN(parsed) ? 0 : parsed
-}
-
-interface QboRef {
-  value: string
-  name: string
-}
+import { bookExpense, bookRefusal } from '../../shared/booking/bookExpense'
+import { getBookingDeps } from '../../shared/booking/bookingDeps'
+import { buildQboPayload } from '../../shared/booking/buildQboPayload'
+import { expenseRepo } from '../../shared/expense/expenseRepo'
+import { getPaymentAccountRef } from '../../shared/expense/getPaymentAccountRef'
+import { ParsedLine } from '../../shared/expense/types'
+import { ApiHandler, parseJsonBody, respond } from '../../shared/http/respond'
+import { resolveChargeKey } from '../../shared/keys'
+import { QboRef } from '../../shared/qbo/types'
+import { AmountInput, parseAmount } from '../../shared/utils/parseAmount'
+import { TABLE_NAME } from '../constants'
+import { respondToBookOutcome } from '../utils/respondToBookOutcome'
 
 interface CorrectLineInput {
   accountRef?: QboRef
-  amount?: number | string
+  amount?: AmountInput
   description?: string
 }
 
@@ -65,54 +38,30 @@ interface CorrectAndSubmitBody {
   documentDate?: string
   memo?: string
   invoiceNumber?: string
-  /** When true, book even if a CHARGE# dedup marker already exists. */
+  /** When true, book even if a CHARGE# marker exists or the expense is submitted/skipped. */
   override?: boolean
   /**
-   * Optional LIGHT optimistic-concurrency guard. If either is provided and does
-   * not match the loaded item, the request is rejected 409 so the client can
-   * reload and retry. Backwards-compatible: when both are absent the write
-   * proceeds. The heavier generic concurrency work is a separate ticket (#4).
+   * Optional LIGHT optimistic-concurrency guard. If either is provided and does not match the
+   * loaded item, the request is rejected 409 so the client can reload and retry.
    */
   expectedStatus?: string
   expectedUpdatedAt?: string
 }
 
-/** Extracts `{documentId}` from the proxied path (`/expenses/{id}/correct-and-submit`). */
-const extractDocumentId = (event: APIGatewayProxyEventV2WithJWTAuthorizer): string | undefined => {
-  const fromParams = event.pathParameters?.documentId
-  if (fromParams) return fromParams
-  // Fallback: parse the raw path (…/expenses/{id}/correct-and-submit).
-  const match = event.rawPath?.match(/\/expenses\/([^/]+)\/correct-and-submit$/)
-  return match?.[1]
-}
-
-export const correctAndSubmit = async (
-  event: APIGatewayProxyEventV2WithJWTAuthorizer,
-  ddbClient: DynamoDBDocumentClient,
-) => {
-  const documentId = extractDocumentId(event)
+export const correctAndSubmit: ApiHandler = async (event, ddb) => {
+  const documentId = event.pathParameters?.documentId
   if (!documentId) {
     return respond(400, { message: 'documentId path parameter is required' })
   }
 
-  const body = JSON.parse(event.body || '{}') as CorrectAndSubmitBody
+  const body = parseJsonBody<CorrectAndSubmitBody>(event)
   const { vendorRef, lines, documentDate, memo, invoiceNumber, override } = body
 
-  // ─── 1. Load current expense state (404 if absent) ─────────────────────────
-  const getResult = await ddbClient.send(
-    new GetCommand({
-      TableName: TABLE_NAME,
-      Key: { pk: `DOC#${documentId}`, sk: 'state' },
-    }),
-  )
-
-  if (!getResult.Item) {
+  const expense = await expenseRepo(ddb, TABLE_NAME).get(documentId)
+  if (!expense) {
     return respond(404, { message: 'Expense not found' })
   }
 
-  const expense = getResult.Item
-
-  // ─── Light optimistic-concurrency guard (opt-in, backwards-compatible) ─────
   if (
     (body.expectedStatus !== undefined && body.expectedStatus !== expense.status) ||
     (body.expectedUpdatedAt !== undefined && body.expectedUpdatedAt !== expense.updatedAt)
@@ -124,21 +73,13 @@ export const correctAndSubmit = async (
     })
   }
 
-  // ─── Case 4 — un-skip gate ─────────────────────────────────────────────────
-  // The automated SQS path refuses to resurrect a `skipped` record. Path B is an
-  // explicit human act, so we ALLOW skipped → submitted — but only when the human
-  // explicitly confirms via `override`. Without it, reject 409 so the UI can
-  // surface a "book anyway?" confirm (reusing the existing override flag).
-  if (expense.status === 'skipped' && override !== true) {
-    return respond(409, {
-      message:
-        'This expense was skipped — set override to book it anyway',
-      error: 'SKIPPED_REQUIRES_OVERRIDE',
-      currentStatus: expense.status,
-    })
+  // Un-skip / rebook gate — fail fast, before validation.
+  const refusal = bookRefusal(expense.status, override)
+  if (refusal) {
+    return respondToBookOutcome({ kind: 'refused', reason: refusal }, '', expense.qboPurchaseId)
   }
 
-  // ─── 2. Validate the human-edited payload BEFORE any QBO call ──────────────
+  // ─── Validate the human-edited payload BEFORE any QBO call ─────────────────
   const errors: Array<{ field: string; message: string }> = []
 
   if (!vendorRef?.value) {
@@ -153,8 +94,7 @@ export const correctAndSubmit = async (
     errors.push({ field: 'lines', message: 'At least one line is required' })
   } else {
     lines.forEach((line, i) => {
-      const amount = parseAmount(line.amount)
-      if (!(amount > 0)) {
+      if (!(parseAmount(line.amount) > 0)) {
         errors.push({
           field: `lines[${i}].amount`,
           message: 'Amount must parse to a positive number',
@@ -169,13 +109,11 @@ export const correctAndSubmit = async (
     })
   }
 
-  if (errors.length > 0) {
+  if (errors.length > 0 || !vendorRef || !documentDate || !lines) {
     return respond(400, { message: 'Validation failed', errors })
   }
 
-  // Non-null-safe now that validation passed.
-  const validLines = lines as CorrectLineInput[]
-  const parsedLines = validLines.map((line) => ({
+  const parsedLines: ParsedLine[] = lines.map((line) => ({
     amount: parseAmount(line.amount),
     accountRef: line.accountRef as QboRef,
     description:
@@ -183,154 +121,61 @@ export const correctAndSubmit = async (
   }))
   const totalAmount = parsedLines.reduce((sum, line) => sum + line.amount, 0)
 
-  // Resolve the payment account from CONFIG#defaults (500 if missing, mirrors setAccount).
-  const configResult = await ddbClient.send(
-    new GetCommand({
-      TableName: TABLE_NAME,
-      Key: { pk: 'CONFIG#defaults', sk: 'v0' },
-    }),
-  )
-  const paymentAccountRef = configResult.Item?.paymentAccountRef as QboRef | undefined
-
-  if (!paymentAccountRef?.value) {
+  const paymentAccountRef = await getPaymentAccountRef(ddb, TABLE_NAME)
+  if (!paymentAccountRef) {
     return respond(500, {
       message: 'No default payment account configured (CONFIG#defaults.paymentAccountRef missing)',
     })
   }
 
-  // ─── 3. Pre-POST dedup check ───────────────────────────────────────────────
-  // Compute the charge key with the shared rule: primary (invoice) key when an
-  // invoice number is given/known, else the amount+date fallback. The key must
-  // match what the automated event-handler + setAccount would compute.
-  const vendorId = (vendorRef as QboRef).value
-  const effectiveInvoiceNumber = invoiceNumber ?? (expense.invoiceNumber as string | undefined)
-  const bookingChargeKey = effectiveInvoiceNumber
-    ? chargeKey(vendorId, effectiveInvoiceNumber)
-    : fallbackChargeKey(vendorId, totalAmount, documentDate as string)
-
-  const markerResult = await ddbClient.send(
-    new GetCommand({
-      TableName: TABLE_NAME,
-      Key: { pk: bookingChargeKey, sk: 'marker' },
-    }),
-  )
-
-  if (markerResult.Item && override !== true) {
-    return respond(409, {
-      message: `Looks already booked as purchase ${markerResult.Item.qboPurchaseId}`,
-      qboPurchaseId: markerResult.Item.qboPurchaseId,
-    })
-  }
-
-  // ─── 4. Build the multi-line QBO payload from the human-edited lines ───────
-  const docNumber = documentId.slice(0, 21)
-  const qboPayload = {
-    docNumber,
-    txnDate: documentDate,
-    paymentType: 'CreditCard',
+  // The vendor/amount may have been corrected, so the charge key is recomputed (shared rule).
+  // An explicit empty string clears a wrongly extracted number; omitted keeps the stored one.
+  const effectiveInvoiceNumber =
+    invoiceNumber === undefined ? expense.invoiceNumber : invoiceNumber.trim() || undefined
+  const qboPayload = buildQboPayload({
+    documentId,
+    documentDate,
     paymentAccountRef,
-    entityRef: vendorRef,
+    vendorRef,
     lines: parsedLines,
     privateNote:
       memo ||
       `Manual correct & submit: ${expense.description || expense.vendorDisplay || expense.vendorName}`,
-  }
+  })
 
-  // Source PDF URI persisted on the DOC# state by the event-handler; when present
-  // the shared primitive best-effort attaches the receipt to the QBO purchase (BDK #7).
-  const originalUri = expense.originalUri as string | undefined
-
-  // ─── 5. Book via the shared primitive (writes the CHARGE# marker + attaches PDF) ─
   try {
-    const now = new Date().toISOString()
-    const result = await submitCharge(
+    const outcome = await bookExpense(
       {
-        qboPayload,
         documentId,
-        chargeKey: bookingChargeKey,
-        vendorId,
-        invoiceNumber: effectiveInvoiceNumber,
-        amount: totalAmount,
-        documentDate: documentDate as string,
-        originalUri,
+        status: expense.status,
+        override,
+        originalUri: expense.originalUri,
+        booked: {
+          vendorRef,
+          // The state must reflect what was actually booked (the human's corrections).
+          vendorName: vendorRef.name,
+          vendorDisplay: vendorRef.name,
+          documentDate,
+          invoiceNumber: effectiveInvoiceNumber,
+          chargeKey: resolveChargeKey({
+            vendorId: vendorRef.value,
+            invoiceNumber: effectiveInvoiceNumber,
+            amount: totalAmount,
+            documentDate,
+          }),
+          amounts: [totalAmount],
+          parsedLines,
+          qboPayload,
+        },
       },
-      ddbClient,
-      { getAuthToken, qboServiceUrl: QBO_SERVICE_URL, tableName: TABLE_NAME, attachPdf },
+      ddb,
+      getBookingDeps(),
     )
-
-    if (result.success) {
-      const purchaseId = result.qboPurchaseId
-
-      // ─── 6. Success state write (clear needsInputType/validationErrors) ────
-      await ddbClient.send(
-        new UpdateCommand({
-          TableName: TABLE_NAME,
-          Key: { pk: `DOC#${documentId}`, sk: 'state' },
-          UpdateExpression:
-            'SET #status = :status, qboDocNumber = :docNo, qboPurchaseId = :pid, submittedAt = :now, lastAttempt = :now, attempts = if_not_exists(attempts, :zero) + :inc, needsInputType = :nit, validationErrors = :ve, parsedLines = :lines, attachmentUploaded = :au, attachmentFailed = :af, vendorName = :vendorName, vendorDisplay = :vendorName, qboVendorRef = :vendorRef, documentDate = :documentDate, invoiceNumber = :invoiceNumber, amounts = :amounts, updatedAt = :now REMOVE failureReason, failedAt',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: {
-            ':status': 'submitted',
-            ':docNo': result.qboDocNumber ?? docNumber,
-            ':pid': purchaseId || '',
-            ':now': now,
-            ':zero': 0,
-            ':inc': 1,
-            ':nit': null,
-            ':ve': null,
-            ':lines': parsedLines,
-            ':au': result.attachmentUploaded ?? null,
-            ':af': result.attachmentFailed ?? null,
-            // The state must reflect what was actually booked (the human's corrections).
-            ':vendorName': (vendorRef as QboRef).name,
-            ':vendorRef': vendorRef,
-            ':documentDate': documentDate,
-            ':invoiceNumber': effectiveInvoiceNumber ?? null,
-            ':amounts': [totalAmount],
-          },
-        }),
-      )
-
-      // Partial-failure passthrough: the PDF attach is best-effort — an attach
-      // failure never rolls back a successful booking (BDK #7).
-      return respond(200, {
-        message: 'Expense corrected and submitted to QBO',
-        purchaseId,
-        attachmentFailed: result.attachmentFailed,
-      })
-    } else {
-      await ddbClient.send(
-        new UpdateCommand({
-          TableName: TABLE_NAME,
-          Key: { pk: `DOC#${documentId}`, sk: 'state' },
-          UpdateExpression:
-            'SET #status = :status, failedAt = :now, failureReason = :reason, lastAttempt = :now, attempts = if_not_exists(attempts, :zero) + :inc, updatedAt = :now',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: {
-            ':status': 'failed',
-            ':now': now,
-            ':reason': result.error || 'QBO submission failed',
-            ':zero': 0,
-            ':inc': 1,
-          },
-        }),
-      )
-
-      // ─── Case 5 — classify the QBO failure for an actionable response ──────
-      // The QBO Service signals an expired QBO OAuth connection with the typed code
-      // QBO_AUTH_EXPIRED (a bare 401 is ambiguous — our own M2M token can be rejected
-      // too); surface an actionable QBO_AUTH_EXPIRED so the UI can prompt a reconnect
-      // instead of a generic retry. All other QBO failures keep the generic 502.
-      if (result.errorCode === 'QBO_AUTH_EXPIRED') {
-        return respond(502, {
-          message: 'QBO connection expired — reconnect QBO and try again',
-          error: 'QBO_AUTH_EXPIRED',
-          intuitTid: result.intuitTid,
-        })
-      }
-
-      return respond(502, { message: `QBO submission failed: ${result.error}` })
-    }
+    return respondToBookOutcome(
+      outcome,
+      'Expense corrected and submitted to QBO',
+      expense.qboPurchaseId,
+    )
   } catch (err) {
     console.error('Error correcting and submitting expense:', err)
     return respond(500, { message: 'Failed to correct and submit expense' })

@@ -21,9 +21,9 @@ import { applyRules, ApplyRulesParams } from '../../lambdas/event-handler/rules/
 import {
   DocumentProcessedDetail,
   ConfigDefaults,
-  QboRef,
   VendorRule,
 } from '../../lambdas/event-handler/types'
+import { QboRef } from '../../lambdas/shared/qbo/types'
 
 const CONFIG: ConfigDefaults = {
   paymentAccountRef: { value: '1', name: 'BDK Credit Card' },

@@ -11,21 +11,11 @@
  *
  * See .kiro/specs/expense-intent-classification/design.md (Stage 3).
  */
+import { chargeKey, fallbackChargeKey } from '../../shared/keys'
 import { BookingOutcome, DecisionInput, IntentConfidence } from './types'
 
 const CONFIDENCE_RANK: Record<IntentConfidence, number> = { low: 0, medium: 1, high: 2 }
 const rank = (c: IntentConfidence): number => CONFIDENCE_RANK[c]
-
-/** Primary charge identity: vendor + the vendor's own invoice number. */
-export const chargeKey = (vendorId: string, invoiceNumber: string): string =>
-  `CHARGE#${vendorId}#INV#${invoiceNumber}`
-
-/** Fallback identity (review-only on match): vendor + amount + date. */
-export const fallbackChargeKey = (
-  vendorId: string,
-  amount: number,
-  documentDate: string,
-): string => `CHARGE#${vendorId}#AMT#${amount.toFixed(2)}#${documentDate}`
 
 export const decideBooking = (i: DecisionInput): BookingOutcome => {
   // 1) Low-confidence → review (fail-safe).

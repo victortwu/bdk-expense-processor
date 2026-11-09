@@ -7,7 +7,7 @@ import {
   VENDOR_FETCH_BACKOFF_MS,
 } from '../constants'
 import { QboVendor } from '../../shared/qbo/types'
-import { getAuthToken } from '../utils/getAuthToken'
+import { getAuthToken } from '../../shared/auth/getAuthToken'
 import { logger } from '../../shared/utils/logger'
 import { FetchListResult, getCachedList, QBO_VENDORS_CACHE } from '../../shared/qbo/listCache'
 

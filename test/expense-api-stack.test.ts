@@ -64,17 +64,6 @@ describe('ExpenseApiStack', () => {
 
   // ─── BDK #7 — manual-path PDF attachment (env + cross-stack grants) ────────
 
-  test('API Lambda has PROCESSED_BUCKET env', () => {
-    template.hasResourceProperties('AWS::Lambda::Function', {
-      FunctionName: 'Beta-BDK-ExpenseProcessor-Api',
-      Environment: {
-        Variables: Match.objectLike({
-          PROCESSED_BUCKET: Match.anyValue(),
-        }),
-      },
-    })
-  })
-
   test('API Lambda role gets s3:GetObject on the processed bucket', () => {
     template.hasResourceProperties('AWS::IAM::Policy', {
       PolicyDocument: {

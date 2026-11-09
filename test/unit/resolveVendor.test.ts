@@ -27,7 +27,7 @@ process.env.MACHINE_CLIENT_ID = 'test-client-id'
 process.env.MACHINE_CLIENT_SECRET = 'test-client-secret'
 
 // Bypass the real Cognito client-credentials fetch.
-jest.mock('../../lambdas/event-handler/utils/getAuthToken', () => ({
+jest.mock('../../lambdas/shared/auth/getAuthToken', () => ({
   getAuthToken: jest.fn().mockResolvedValue('test-token'),
 }))
 

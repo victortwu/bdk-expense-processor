@@ -1,11 +1,6 @@
 import { extractLineItems } from '../../utils/extractLineItems'
-import {
-  DocumentProcessedDetail,
-  RuleResult,
-  ParsedLine,
-  VendorRule,
-  ConfigDefaults,
-} from '../../types'
+import { DocumentProcessedDetail, RuleResult, VendorRule, ConfigDefaults } from '../../types'
+import { ParsedLine } from '../../../shared/expense/types'
 import { DEFAULT_ARITHMETIC_TOLERANCE, FALLBACK_CATEGORY_TO_ACCOUNT } from '../../constants'
 
 export const catalogReconcile = async (

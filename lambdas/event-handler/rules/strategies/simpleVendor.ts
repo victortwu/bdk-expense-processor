@@ -1,6 +1,8 @@
 import { QBO_SERVICE_URL } from '../../constants'
-import { DocumentProcessedDetail, RuleResult, QboRef, ConfigDefaults } from '../../types'
-import { getAuthToken } from '../../utils/getAuthToken'
+import { DocumentProcessedDetail, RuleResult, ConfigDefaults } from '../../types'
+import { getAuthToken } from '../../../shared/auth/getAuthToken'
+import { QboRef } from '../../../shared/qbo/types'
+import { parseAmount } from '../../../shared/utils/parseAmount'
 
 export const simpleVendor = async (
   detail: DocumentProcessedDetail,
@@ -86,14 +88,4 @@ const getLastExpenseAccount = async (vendorId: string): Promise<QboRef | null> =
     console.error('Error querying QBO purchase history:', err)
     return null
   }
-}
-
-/**
- * Parses amount strings like "$2,835.09" or "2835.09" into a number.
- */
-const parseAmount = (raw: string | number): number => {
-  if (typeof raw === 'number') return raw
-  const cleaned = raw.replace(/[$,]/g, '')
-  const parsed = parseFloat(cleaned)
-  return isNaN(parsed) ? 0 : parsed
 }

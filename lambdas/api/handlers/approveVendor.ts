@@ -1,37 +1,29 @@
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
-import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
-import { getAuthToken } from '../utils/getAuthToken'
-import { QBO_VENDORS_CACHE } from '../../shared/qbo/listCache'
+import { getAuthToken } from '../../shared/auth/getAuthToken'
+import { expenseRepo } from '../../shared/expense/expenseRepo'
+import { ExpenseStatus } from '../../shared/expense/status'
+import { ApiHandler, parseJsonBody, respond } from '../../shared/http/respond'
+import { invalidateCache, QBO_VENDORS_CACHE } from '../../shared/qbo/listCache'
 import { QboVendor } from '../../shared/qbo/types'
+import { QBO_SERVICE_URL, TABLE_NAME } from '../constants'
 
-export const approveVendor = async (
-  event: APIGatewayProxyEventV2WithJWTAuthorizer,
-  ddbClient: DynamoDBDocumentClient,
-) => {
-  const body = JSON.parse(event.body || '{}')
-  const { documentId, vendorName } = body as { documentId: string; vendorName: string }
+export const approveVendor: ApiHandler = async (event, ddbClient) => {
+  const { documentId, vendorName } = parseJsonBody<{ documentId?: string; vendorName?: string }>(
+    event,
+  )
 
   if (!documentId || !vendorName) {
     return respond(400, { message: 'documentId and vendorName are required' })
   }
 
-  // Get current expense state
-  const getResult = await ddbClient.send(
-    new GetCommand({
-      TableName: TABLE_NAME,
-      Key: { pk: `DOC#${documentId}`, sk: 'state' },
-    }),
-  )
-
-  if (!getResult.Item) {
+  const repo = expenseRepo(ddbClient, TABLE_NAME)
+  const expense = await repo.get(documentId)
+  if (!expense) {
     return respond(404, { message: 'Expense not found' })
   }
 
-  if (getResult.Item.needsInputType !== 'new_vendor') {
+  if (expense.needsInputType !== 'new_vendor') {
     return respond(400, {
-      message: `Expense is not awaiting vendor approval (current: ${getResult.Item.needsInputType})`,
+      message: `Expense is not awaiting vendor approval (current: ${expense.needsInputType})`,
     })
   }
 
@@ -68,41 +60,31 @@ export const approveVendor = async (
       })
     }
 
-    // Update expense state to pending re-processing
-    const now = new Date().toISOString()
-    await ddbClient.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { pk: `DOC#${documentId}`, sk: 'state' },
-        UpdateExpression:
-          'SET #status = :status, qboVendorRef = :vendorRef, needsInputType = :nit, validationErrors = :ve, updatedAt = :now',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: {
-          ':status': 'pending_validation',
-          ':vendorRef': { value: newVendor.id, name: newVendor.displayName ?? vendorName },
-          ':nit': null,
-          ':ve': null,
-          ':now': now,
-        },
-      }),
-    )
-
-    // Invalidate vendor cache so next processing picks up the new vendor
-    await ddbClient
-      .send(
-        new UpdateCommand({
-          TableName: TABLE_NAME,
-          Key: QBO_VENDORS_CACHE.key,
-          UpdateExpression: 'SET refreshedAt = :stale',
-          ExpressionAttributeValues: { ':stale': '2000-01-01T00:00:00.000Z' },
-        }),
-      )
-      .catch(() => {
-        /* cache might not exist yet */
+    // The stored ref + display name are what the event-handler re-reads on reprocess.
+    const vendorRef = { value: newVendor.id, name: newVendor.displayName ?? vendorName }
+    const updated = await repo.transition(documentId, {
+      notFrom: [ExpenseStatus.Submitted, ExpenseStatus.Skipped],
+      to: ExpenseStatus.PendingValidation,
+      set: {
+        qboVendorRef: vendorRef,
+        vendorDisplay: vendorRef.name,
+        needsInputType: null,
+        validationErrors: null,
+      },
+    })
+    if (!updated) {
+      return respond(409, {
+        message: 'Expense changed while approving the vendor — reload and retry',
       })
+    }
+
+    // Invalidate vendor cache so the next lookup sees the new vendor
+    await invalidateCache(ddbClient, TABLE_NAME, QBO_VENDORS_CACHE)
 
     return respond(200, {
-      message: 'Vendor created in QBO. Document will be re-processed on next event.',
+      message: isDuplicate
+        ? `Vendor "${vendorRef.name}" already exists in QBO and was linked. The expense stays pending validation until it is re-processed.`
+        : 'Vendor created in QBO. The expense stays pending validation until it is re-processed.',
       vendor: newVendor,
     })
   } catch (err) {

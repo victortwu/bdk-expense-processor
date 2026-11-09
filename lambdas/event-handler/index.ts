@@ -1,23 +1,29 @@
 import type { SQSHandler } from 'aws-lambda'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb'
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
-import { TABLE_NAME, QBO_SERVICE_URL } from './constants'
+import { TABLE_NAME } from './constants'
 import { resolveVendor } from './vendors/resolveVendor'
 import { classifyVendor } from './vendors/classifyVendor'
 import { applyRules, getConfig, getVendorRule } from './rules/engine'
-import { attachPdf } from './utils/attachPdf'
 import { emitNotification } from './utils/emitNotification'
-import { getAuthToken } from './utils/getAuthToken'
-import { DocumentProcessedDetail, ExpenseState, QboRef } from './types'
+import { DocumentProcessedDetail, RuleResult } from './types'
 import { classifyIntent } from './intent/classifyIntent'
-import { decideBooking, chargeKey, fallbackChargeKey } from './intent/decideBooking'
+import { decideBooking } from './intent/decideBooking'
 import { BookingOutcome, IntentResult } from './intent/types'
-import { submitCharge } from '../shared/booking/submitCharge'
+import { bookExpense } from '../shared/booking/bookExpense'
+import { getBookingDeps } from '../shared/booking/bookingDeps'
+import { expenseRepo } from '../shared/expense/expenseRepo'
+import { ExpenseStatus } from '../shared/expense/status'
+import { ExpenseState } from '../shared/expense/types'
+import { chargeKey, docKey, fallbackChargeKey, markerKey, resolveChargeKey } from '../shared/keys'
+import { QboRef } from '../shared/qbo/types'
+import { parseAmount } from '../shared/utils/parseAmount'
 import { logger } from '../shared/utils/logger'
 
 const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient({}))
 const s3Client = new S3Client({})
+const repo = expenseRepo(ddbClient, TABLE_NAME)
 
 export const handler: SQSHandler = async (event) => {
   for (const record of event.Records) {
@@ -28,9 +34,10 @@ export const handler: SQSHandler = async (event) => {
 
       logger.appendKeys({ documentId, tenantId: detail.tenantId })
 
-      // Set by the intent gate (step 6a) when the outcome is `book`; consumed at
-      // step 9a to write the dedup CHARGE# marker after a successful submit.
+      // Set by the intent gate (step 6a) when the outcome is `book`: the dedup key and the
+      // vendor's invoice number, both persisted on the state so manual paths agree with us.
       let bookingChargeKey: string | undefined
+      let invoiceNumber: string | undefined
 
       // Source PDF URI for the best-effort attach (step 9a) AND for persistence
       // onto the DOC# state so MANUAL booking paths (setAccount / correct-and-
@@ -39,13 +46,11 @@ export const handler: SQSHandler = async (event) => {
       const originalUri = detail.originalUri || deriveOriginalUri(extractedTextUri) || undefined
 
       // ─── 1. Idempotency Check ──────────────────────────────────────────────
-      const existing = await ddbClient.send(
-        new GetCommand({ TableName: TABLE_NAME, Key: { pk: `DOC#${documentId}`, sk: 'state' } }),
-      )
+      const existing = await repo.get(documentId)
 
-      if (existing.Item) {
-        const currentStatus = existing.Item.status
-        if (currentStatus === 'submitted' || currentStatus === 'skipped') {
+      if (existing) {
+        const currentStatus = existing.status
+        if (currentStatus === ExpenseStatus.Submitted || currentStatus === ExpenseStatus.Skipped) {
           logger.info('Idempotency skip', { currentStatus })
           continue
         }
@@ -67,6 +72,15 @@ export const handler: SQSHandler = async (event) => {
         qboVendorRef = vendorRule.qboVendorRef
         logger.info('Vendor resolved', {
           path: 'deterministic',
+          vendorName,
+          qboVendorName: qboVendorRef.name,
+        })
+      } else if (existing?.status === ExpenseStatus.PendingValidation && existing.qboVendorRef) {
+        // A human just approved/adopted this vendor (approveVendor) — trust that ref rather
+        // than re-resolving by name, which can loop back to new_vendor.
+        qboVendorRef = existing.qboVendorRef
+        logger.info('Vendor resolved', {
+          path: 'approved',
           vendorName,
           qboVendorName: qboVendorRef.name,
         })
@@ -96,11 +110,10 @@ export const handler: SQSHandler = async (event) => {
           extractedDate: detail.documentDate,
           extractedSubType: detail.subType,
         })
-        await writeState(
-          documentId,
+        await saveState(
           detail,
           {
-            status: 'needs_input',
+            status: ExpenseStatus.NeedsInput,
             needsInputType: 'new_vendor',
             validationErrors: [
               {
@@ -109,7 +122,7 @@ export const handler: SQSHandler = async (event) => {
               },
             ],
           },
-          existing.Item,
+          existing,
         )
 
         await emitNotification({
@@ -143,16 +156,18 @@ export const handler: SQSHandler = async (event) => {
       // fail safe. If the intent layer resolves to anything other than `book`, we
       // short-circuit BEFORE applyRules/submit and record a non-booking state.
       if (detail.documentType === 'financial') {
-        const outcome = await runIntentGate({
+        const { outcome, intent } = await runIntentGate({
           detail,
           extractedText,
           vendorId: qboVendorRef.value,
           documentProfile: vendorRule?.documentProfile,
         })
 
+        invoiceNumber = intent.invoiceNumber
+
         if (outcome.action !== 'book') {
           const stateOverride = mapOutcomeToState(outcome)
-          await writeState(documentId, detail, { ...stateOverride, qboVendorRef }, existing.Item)
+          await saveState(detail, { ...stateOverride, qboVendorRef, invoiceNumber }, existing)
           // Only alert a human when the outcome genuinely needs review. A
           // skip_duplicate / informational outcome is a correct auto-decision —
           // the structured 'Intent decision' log already covers observability,
@@ -169,8 +184,7 @@ export const handler: SQSHandler = async (event) => {
           continue
         }
 
-        // action === 'book' → remember the chargeKey so we can write the dedup
-        // marker after a successful QBO submit (step 9a).
+        // action === 'book' → the chargeKey is the dedup identity bookExpense reserves/records.
         bookingChargeKey = outcome.chargeKey
       }
 
@@ -185,81 +199,31 @@ export const handler: SQSHandler = async (event) => {
         config,
       })
 
-      // ─── 8. Submit or Record ───────────────────────────────────────────────
-      const now = new Date().toISOString()
-      let status = ruleResult.status as string
-      let qboDocNumber: string | undefined
-      let qboPurchaseId: string | undefined
-      let submittedAt: string | undefined
-      let failedAt: string | undefined
-      let failureReason: string | undefined
-      let attachmentUploaded: boolean | undefined
-      let attachmentFailed: boolean | undefined
+      // ─── 8. Persist the decision, then book ────────────────────────────────
+      // The state (incl. the prebuilt qboPayload, so a later bulk Submit/Retry works) is
+      // written BEFORE booking; bookExpense then moves it ready → submitted/failed.
+      const ready = ruleResult.status === 'ready' && ruleResult.qboPayload
+      const saved = await saveState(
+        detail,
+        {
+          status: ruleResult.status,
+          qboVendorRef,
+          invoiceNumber,
+          chargeKey: ready ? bookingChargeKey : undefined,
+          parsedLines: ruleResult.parsedLines,
+          qboPayload: ruleResult.qboPayload,
+          validationErrors: ruleResult.validationErrors,
+          needsInputType: ruleResult.needsInputType,
+        },
+        existing,
+      )
 
-      if (ruleResult.status === 'ready' && ruleResult.qboPayload) {
-        const autoSubmit = vendorRule?.autoSubmit !== false
-        logger.info('AutoSubmit decision', { autoSubmit, vendorName })
-        if (autoSubmit) {
-          const qboResult = await submitCharge(
-            {
-              qboPayload: ruleResult.qboPayload,
-              documentId,
-              // Preserve the former derivation EXACTLY: the invoice number is the
-              // segment after #INV# in the primary charge key (undefined for a
-              // fallback key) so the marker item shape stays byte-identical.
-              chargeKey: bookingChargeKey,
-              vendorId: qboVendorRef.value,
-              invoiceNumber: bookingChargeKey?.split('#INV#')[1],
-              amount: parseAmount(detail.amounts?.[0] ?? 0),
-              documentDate: detail.documentDate || '',
-              originalUri,
-            },
-            ddbClient,
-            {
-              getAuthToken,
-              qboServiceUrl: QBO_SERVICE_URL,
-              tableName: TABLE_NAME,
-              attachPdf,
-            },
-          )
+      if (!saved) {
+        logger.info('Record left untouched (user-skipped or already submitted)')
+        continue
+      }
 
-          if (qboResult.success) {
-            status = 'submitted'
-            qboDocNumber = qboResult.qboDocNumber
-            qboPurchaseId = qboResult.qboPurchaseId
-            submittedAt = now
-            logger.info('QBO submit outcome', { outcome: 'submitted', qboDocNumber, qboPurchaseId })
-
-            if (qboResult.attachmentUploaded) {
-              attachmentUploaded = true
-              logger.info('Attachment outcome', { outcome: 'uploaded', qboPurchaseId })
-            } else if (qboResult.attachmentFailed) {
-              attachmentFailed = true
-              logger.warn('Attachment outcome', { outcome: 'failed', qboPurchaseId })
-              await emitNotification({
-                type: 'attachment_failed',
-                documentId,
-                vendorName,
-                message: 'PDF attachment failed',
-              })
-            }
-          } else {
-            status = 'failed'
-            failedAt = now
-            failureReason = qboResult.error
-            logger.warn('QBO submit outcome', { outcome: 'failed', reason: qboResult.error })
-
-            await emitNotification({
-              type: 'submission_failed',
-              documentId,
-              vendorName,
-              message: `QBO submission failed: ${qboResult.error}`,
-            })
-          }
-        }
-        // If autoSubmit is false, status stays 'ready' for manual submission
-      } else if (ruleResult.status === 'needs_input') {
-        // Emit notification for needs_input
+      if (ruleResult.status === 'needs_input') {
         const notifType = ruleResult.needsInputType || 'pick_expense_account'
         logger.warn('Rule result needs_input', { needsInputType: notifType })
         await emitNotification({
@@ -268,30 +232,29 @@ export const handler: SQSHandler = async (event) => {
           vendorName,
           message: ruleResult.validationErrors?.[0]?.reason || 'Human input required',
         })
+      } else if (ruleResult.qboPayload) {
+        const autoSubmit = vendorRule?.autoSubmit !== false
+        logger.info('AutoSubmit decision', { autoSubmit, vendorName })
+        if (autoSubmit) {
+          await bookReady({
+            detail,
+            qboVendorRef,
+            invoiceNumber,
+            chargeKey:
+              bookingChargeKey ??
+              resolveChargeKey({
+                vendorId: qboVendorRef.value,
+                amount: parseAmount(detail.amounts?.[0]),
+                documentDate: detail.documentDate || '',
+              }),
+            ruleResult,
+            originalUri,
+          })
+        }
+        // If autoSubmit is false, status stays 'ready' for manual submission
       }
 
-      // ─── 10. Write State ───────────────────────────────────────────────────
-      await writeState(
-        documentId,
-        detail,
-        {
-          status,
-          qboVendorRef,
-          parsedLines: ruleResult.parsedLines,
-          validationErrors: ruleResult.validationErrors,
-          needsInputType: ruleResult.needsInputType,
-          qboDocNumber,
-          qboPurchaseId,
-          submittedAt,
-          failedAt,
-          failureReason,
-          attachmentUploaded,
-          attachmentFailed,
-        },
-        existing.Item,
-      )
-
-      logger.info('Record processed', { status })
+      logger.info('Record processed', { status: ruleResult.status })
     } catch (err) {
       const error = err as Error
       logger.error('Expense record processing failed', {
@@ -307,14 +270,6 @@ export const handler: SQSHandler = async (event) => {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Parse a dollar-formatted string (or number) into a numeric amount. */
-const parseAmount = (raw: string | number | undefined): number => {
-  if (raw === undefined) return 0
-  if (typeof raw === 'number') return raw
-  const parsed = parseFloat(raw.replace(/[$,]/g, ''))
-  return isNaN(parsed) ? 0 : parsed
-}
-
 interface IntentGateParams {
   detail: DocumentProcessedDetail
   extractedText: string
@@ -329,7 +284,9 @@ interface IntentGateParams {
  * = the primary CHARGE#{vendorId}#INV#{invoiceNumber}, every referenced-invoice
  * key (receipts), and the amount+date fallback key.
  */
-const runIntentGate = async (params: IntentGateParams): Promise<BookingOutcome> => {
+const runIntentGate = async (
+  params: IntentGateParams,
+): Promise<{ outcome: BookingOutcome; intent: IntentResult }> => {
   const { detail, extractedText, vendorId, documentProfile } = params
   const amount = parseAmount(detail.amounts?.[0])
   const documentDate = detail.documentDate || ''
@@ -355,7 +312,7 @@ const runIntentGate = async (params: IntentGateParams): Promise<BookingOutcome> 
   await Promise.all(
     [...candidateKeys].map(async (key) => {
       const res = await ddbClient.send(
-        new GetCommand({ TableName: TABLE_NAME, Key: { pk: key, sk: 'marker' } }),
+        new GetCommand({ TableName: TABLE_NAME, Key: markerKey(key) }),
       )
       if (res.Item?.qboPurchaseId) {
         markerMap.set(key, { qboPurchaseId: String(res.Item.qboPurchaseId) })
@@ -386,7 +343,7 @@ const runIntentGate = async (params: IntentGateParams): Promise<BookingOutcome> 
     referencedCount: intent.referencedInvoiceNumbers.length,
   })
 
-  return outcome
+  return { outcome, intent }
 }
 
 /**
@@ -397,25 +354,24 @@ const mapOutcomeToState = (outcome: BookingOutcome): StateOverrides => {
   switch (outcome.action) {
     case 'skip_duplicate':
       return {
-        status: 'skipped',
-        needsInputType: undefined,
+        status: ExpenseStatus.Skipped,
         failureReason: `Duplicate of QBO purchase ${outcome.existingQboPurchaseId}`,
       }
     case 'informational':
       return {
-        status: 'skipped',
+        status: ExpenseStatus.Skipped,
         failureReason: `Informational (${outcome.reason}) — no booking required`,
       }
     case 'needs_review':
       return {
-        status: 'needs_input',
+        status: ExpenseStatus.NeedsInput,
         needsInputType: 'pick_expense_account',
         validationErrors: [{ field: 'intent', reason: outcome.reason }],
         failureReason: `Needs review: ${outcome.reason}`,
       }
     default:
       // `book` is handled inline (never reaches here); fail safe to review.
-      return { status: 'needs_input', needsInputType: 'pick_expense_account' }
+      return { status: ExpenseStatus.NeedsInput, needsInputType: 'pick_expense_account' }
   }
 }
 
@@ -440,42 +396,19 @@ const deriveOriginalUri = (extractedTextUri: string): string | null => {
   return extractedTextUri.replace('/extracted.txt', '/original.pdf')
 }
 
-interface StateOverrides {
-  status: string
-  qboVendorRef?: QboRef
-  parsedLines?: unknown[]
-  validationErrors?: unknown[]
-  needsInputType?: string
-  qboDocNumber?: string
-  qboPurchaseId?: string
-  submittedAt?: string
-  failedAt?: string
-  failureReason?: string
-  attachmentUploaded?: boolean
-  attachmentFailed?: boolean
-}
+type StateOverrides = Pick<ExpenseState, 'status'> & Partial<Omit<ExpenseState, 'status'>>
 
-const writeState = async (
-  documentId: string,
+/** Everything about a document that comes from the event itself. */
+const buildState = (
   detail: DocumentProcessedDetail,
   overrides: StateOverrides,
-  existingItem: Record<string, unknown> | undefined,
-): Promise<void> => {
+  existing: ExpenseState | undefined,
+): ExpenseState => {
   const now = new Date().toISOString()
-  const isReprocess = !!existingItem
-  const attempts = isReprocess
-    ? ((existingItem?.attempts as number) || 0) +
-      (overrides.status === 'submitted' || overrides.status === 'failed' ? 1 : 0)
-    : overrides.status === 'submitted' || overrides.status === 'failed'
-      ? 1
-      : 0
-
-  const state: ExpenseState = {
-    pk: `DOC#${documentId}`,
-    sk: 'state',
+  return {
+    ...docKey(detail.documentId),
     tenantId: detail.tenantId,
-    documentId,
-    status: overrides.status,
+    documentId: detail.documentId,
     vendorName: detail.vendorName || 'unknown',
     vendorDisplay: detail.vendorDisplay,
     documentDate: detail.documentDate || '',
@@ -483,40 +416,100 @@ const writeState = async (
     description: detail.description,
     // Persist the source PDF URI so MANUAL booking paths can attach it later (BDK #7).
     originalUri: detail.originalUri || deriveOriginalUri(detail.extractedTextUri) || undefined,
-    parsedLines: overrides.parsedLines as ExpenseState['parsedLines'],
-    validationErrors: overrides.validationErrors as ExpenseState['validationErrors'],
-    needsInputType: overrides.needsInputType as ExpenseState['needsInputType'],
-    qboDocNumber: overrides.qboDocNumber,
-    qboPurchaseId: overrides.qboPurchaseId,
-    qboVendorRef: overrides.qboVendorRef,
-    attachmentUploaded: overrides.attachmentUploaded,
-    attachmentFailed: overrides.attachmentFailed,
-    submittedAt: overrides.submittedAt,
-    failedAt: overrides.failedAt,
-    failureReason: overrides.failureReason,
-    lastAttempt:
-      overrides.status === 'submitted' || overrides.status === 'failed' ? now : undefined,
-    attempts,
-    createdAt: (existingItem?.createdAt as string) || now,
+    attempts: existing?.attempts ?? 0,
+    createdAt: existing?.createdAt || now,
     updatedAt: now,
+    ...overrides,
   }
+}
 
-  await ddbClient
-    .send(
-      new PutCommand({
-        TableName: TABLE_NAME,
-        Item: state,
-        // Idempotency: don't overwrite if someone skipped it
-        ConditionExpression: 'attribute_not_exists(pk) OR #status <> :skipped',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: { ':skipped': 'skipped' },
-      }),
-    )
-    .catch((err) => {
-      if (err.name === 'ConditionalCheckFailedException') {
-        logger.info('State not overwritten (user-skipped)', { documentId })
-      } else {
-        throw err
+/** Write the pipeline-owned state; `false` when a skipped/submitted record was left untouched. */
+const saveState = async (
+  detail: DocumentProcessedDetail,
+  overrides: StateOverrides,
+  existing: ExpenseState | undefined,
+): Promise<boolean> => {
+  const state = buildState(detail, overrides, existing)
+  if (!existing && (await repo.createIfAbsent(state))) return true
+  return repo.replaceUnlessTerminal(state)
+}
+
+interface BookReadyParams {
+  detail: DocumentProcessedDetail
+  qboVendorRef: QboRef
+  invoiceNumber?: string
+  chargeKey: string
+  ruleResult: RuleResult
+  originalUri?: string
+}
+
+/** Book a persisted `ready` expense through the shared path and raise the matching alerts. */
+const bookReady = async (p: BookReadyParams): Promise<void> => {
+  const { detail, ruleResult, qboVendorRef } = p
+  const { documentId } = detail
+  const vendorName = detail.vendorName
+
+  const outcome = await bookExpense(
+    {
+      documentId,
+      status: ExpenseStatus.Ready,
+      originalUri: p.originalUri,
+      booked: {
+        vendorRef: qboVendorRef,
+        vendorName: detail.vendorName || 'unknown',
+        vendorDisplay: detail.vendorDisplay,
+        documentDate: detail.documentDate || '',
+        invoiceNumber: p.invoiceNumber,
+        chargeKey: p.chargeKey,
+        amounts: detail.amounts || [],
+        parsedLines: ruleResult.parsedLines ?? [],
+        qboPayload: ruleResult.qboPayload!,
+      },
+    },
+    ddbClient,
+    getBookingDeps(),
+  )
+
+  switch (outcome.kind) {
+    case 'submitted': {
+      const { qboPurchaseId, qboDocNumber } = outcome.result
+      logger.info('QBO submit outcome', { outcome: 'submitted', qboDocNumber, qboPurchaseId })
+      if (outcome.result.attachmentUploaded) {
+        logger.info('Attachment outcome', { outcome: 'uploaded', qboPurchaseId })
+      } else if (outcome.result.attachmentFailed) {
+        logger.warn('Attachment outcome', { outcome: 'failed', qboPurchaseId })
+        await emitNotification({
+          type: 'attachment_failed',
+          documentId,
+          vendorName,
+          message: 'PDF attachment failed',
+        })
       }
-    })
+      return
+    }
+    case 'failed':
+      logger.warn('QBO submit outcome', { outcome: 'failed', reason: outcome.result.error })
+      await emitNotification({
+        type: 'submission_failed',
+        documentId,
+        vendorName,
+        message: `QBO submission failed: ${outcome.result.error}`,
+      })
+      return
+    case 'duplicate':
+      // Lost a race for the same charge: the winner records the booking, this copy is redundant.
+      logger.info('Booking skipped as duplicate', {
+        existingPurchaseId: outcome.existingPurchaseId,
+      })
+      if (outcome.existingPurchaseId) {
+        await repo.transition(documentId, {
+          from: [ExpenseStatus.Ready],
+          to: ExpenseStatus.Skipped,
+          set: { failureReason: `Duplicate of QBO purchase ${outcome.existingPurchaseId}` },
+        })
+      }
+      return
+    default:
+      logger.warn('Booking not recorded', { outcome: outcome.kind })
+  }
 }

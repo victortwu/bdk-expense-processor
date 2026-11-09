@@ -1,10 +1,16 @@
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  UpdateCommand,
+} from '@aws-sdk/lib-dynamodb'
+import { cacheKey } from '../keys'
 import { logger } from '../utils/logger'
 
 // Cache records live in the expense table as { pk, sk, <field>: T[], refreshedAt }.
-// approveVendor invalidates the vendors record by setting refreshedAt to the past.
-export const QBO_VENDORS_CACHE = { key: { pk: 'CACHE#qbo-vendors', sk: 'v0' }, field: 'vendors' }
-export const QBO_ACCOUNTS_CACHE = { key: { pk: 'CACHE#qbo-accounts', sk: 'v0' }, field: 'accounts' }
+// `invalidateCache` marks a record stale by setting refreshedAt to the past.
+export const QBO_VENDORS_CACHE = { key: cacheKey('qbo-vendors'), field: 'vendors' }
+export const QBO_ACCOUNTS_CACHE = { key: cacheKey('qbo-accounts'), field: 'accounts' }
 
 export type FetchListResult<T> = { ok: true; items: T[] } | { ok: false }
 
@@ -70,4 +76,27 @@ export const getCachedList = async <T>({
     })
   }
   return { items: result.items, refreshedAt }
+}
+
+/** Force the next read of a list cache to refetch. Best-effort: never throws. */
+export const invalidateCache = async (
+  ddb: DynamoDBDocumentClient,
+  tableName: string,
+  cache: { key: { pk: string; sk: string } },
+): Promise<void> => {
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: tableName,
+        Key: cache.key,
+        UpdateExpression: 'SET refreshedAt = :stale',
+        ExpressionAttributeValues: { ':stale': '2000-01-01T00:00:00.000Z' },
+      }),
+    )
+  } catch (err) {
+    logger.warn('QBO list cache invalidation failed', {
+      cacheKey: cache.key.pk,
+      error: String(err),
+    })
+  }
 }

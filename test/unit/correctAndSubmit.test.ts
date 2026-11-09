@@ -25,6 +25,7 @@ import {
   PutCommand,
 } from '@aws-sdk/lib-dynamodb'
 import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
+import { installFakeTable } from '../helpers/fakeTable'
 
 process.env.TABLE_NAME = 'test-expense-table'
 process.env.QBO_SERVICE_URL = 'https://qbo-service.test'
@@ -32,7 +33,7 @@ process.env.COGNITO_TOKEN_URL = 'https://cognito.test/oauth2/token'
 process.env.MACHINE_CLIENT_ID = 'test-client-id'
 process.env.MACHINE_CLIENT_SECRET = 'test-client-secret'
 
-jest.mock('../../lambdas/api/utils/getAuthToken', () => ({
+jest.mock('../../lambdas/shared/auth/getAuthToken', () => ({
   getAuthToken: jest.fn().mockResolvedValue('test-token'),
 }))
 
@@ -146,11 +147,11 @@ describe('correctAndSubmit', () => {
     expect(payload.privateNote).toBe('corrected by human')
     expect(payload.docNumber).toBe(DOC_ID.slice(0, 21))
     // CHARGE# marker written via submitCharge (primary invoice key)
-    const markerPut = ddbMock
+    const markerPuts = ddbMock
       .commandCalls(PutCommand)
-      .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
-    const marker = markerPut?.args[0].input.Item as Record<string, unknown> | undefined
-    expect(marker).toBeDefined()
+      .filter((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
+    expect(markerPuts).toHaveLength(2) // reservation, then the final marker
+    const marker = markerPuts[1].args[0].input.Item as Record<string, unknown> | undefined
     expect(marker?.pk).toBe(CHARGE_KEY)
     expect(marker?.qboPurchaseId).toBe('200')
     // state → submitted
@@ -161,8 +162,8 @@ describe('correctAndSubmit', () => {
       stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
     ).ExpressionAttributeValues
     expect(values?.[':status']).toBe('submitted')
-    expect(values?.[':pid']).toBe('200')
-    expect(values?.[':nit']).toBeNull()
+    expect(values?.[':qboPurchaseId']).toBe('200')
+    expect(values?.[':needsInputType']).toBeNull()
   })
 
   test('success persists the human-corrected vendor, date, invoice and booked total on the state', async () => {
@@ -211,10 +212,10 @@ describe('correctAndSubmit', () => {
     expect(assigned('invoiceNumber')).toBe('X-1')
     expect(assigned('amounts')).toEqual([553.79])
     // stale failure/skip text must not survive a successful booking
-    expect(set).toMatch(/REMOVE failureReason, failedAt/)
+    expect(set).toMatch(/REMOVE #failureReason, #failedAt/)
   })
 
-  test('missing invoice number is stored as null and a missing vendor name is rejected', async () => {
+  test('missing invoice number books under the fallback key and a missing vendor name is rejected', async () => {
     // arrange
     ddbMock
       .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
@@ -242,6 +243,7 @@ describe('correctAndSubmit', () => {
       .find((c) => (c.args[0].input as { Key?: { pk?: string } }).Key?.pk === `DOC#${DOC_ID}`)
     const vals = (upd?.args[0].input as { ExpressionAttributeValues: Record<string, unknown> })
       .ExpressionAttributeValues
+    // no invoice number anywhere → stored as null (clears any stale value)
     expect(vals[':invoiceNumber']).toBeNull()
     expect(noName.statusCode).toBe(400)
     expect(JSON.parse(noName.body).errors).toEqual([
@@ -388,10 +390,11 @@ describe('correctAndSubmit', () => {
       stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
     ).ExpressionAttributeValues
     expect(values?.[':status']).toBe('failed')
-    const markerPut = ddbMock
+    // a failed booking never leaves a booked marker (the reservation is released)
+    const bookedMarker = ddbMock
       .commandCalls(PutCommand)
-      .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
-    expect(markerPut).toBeUndefined()
+      .find((c) => (c.args[0].input as { Item?: { qboPurchaseId?: string } }).Item?.qboPurchaseId)
+    expect(bookedMarker).toBeUndefined()
   })
 
   test('(case 5) bare 401 WITHOUT QBO_AUTH_EXPIRED code (e.g. gateway rejects our token) → generic 502', async () => {
@@ -489,6 +492,148 @@ describe('correctAndSubmit', () => {
     expect(values?.[':status']).toBe('submitted')
   })
 
+  // ─── Rebook / adopt (state-consistency audit) ────────────────────────────
+
+  test('submitted expense without override → 409 ALREADY_SUBMITTED, NO QBO fetch', async () => {
+    ddbMock
+      .on(GetCommand, { Key: { pk: `DOC#${DOC_ID}`, sk: 'state' } })
+      .resolves({ Item: { ...expenseState, status: 'submitted', qboPurchaseId: 'P-OLD' } })
+    mockFetch(okQboResponse)
+
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    expect(res.statusCode).toBe(409)
+    // HEAD wire contract: the FE reads qboPurchaseId as "already booked" (override offer).
+    expect(JSON.parse(res.body)).toEqual({
+      message: 'Expense already submitted to QBO — set override to rebook',
+      qboPurchaseId: 'P-OLD',
+    })
+    expect(global.fetch).not.toHaveBeenCalled()
+  })
+
+  test('skipped without override → 409 SKIPPED_REQUIRES_OVERRIDE body unchanged', async () => {
+    installFakeTable(ddbMock, [{ ...expenseState, status: 'skipped' }, configDefaults])
+    mockFetch(okQboResponse)
+
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    expect(res.statusCode).toBe(409)
+    expect(JSON.parse(res.body)).toEqual({
+      message: 'This expense was skipped — set override to book it anyway',
+      error: 'SKIPPED_REQUIRES_OVERRIDE',
+      currentStatus: 'skipped',
+    })
+  })
+
+  test('fresh in-flight reservation → 409 BOOKING_IN_PROGRESS, no qboPurchaseId (not an override offer)', async () => {
+    installFakeTable(ddbMock, [
+      expenseState,
+      configDefaults,
+      {
+        pk: CHARGE_KEY,
+        sk: 'marker',
+        documentId: 'OTHER',
+        reservedAt: new Date().toISOString(),
+      },
+    ])
+    mockFetch(okQboResponse)
+
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    expect(res.statusCode).toBe(409)
+    const body = JSON.parse(res.body)
+    expect(body).toEqual({
+      message: 'This charge is already being booked — try again shortly',
+      error: 'BOOKING_IN_PROGRESS',
+    })
+    expect(global.fetch).not.toHaveBeenCalled()
+  })
+
+  test('booked marker for another document → 409 {message, qboPurchaseId}', async () => {
+    installFakeTable(ddbMock, [
+      expenseState,
+      configDefaults,
+      { pk: CHARGE_KEY, sk: 'marker', documentId: 'OTHER', qboPurchaseId: '999' },
+    ])
+    mockFetch(okQboResponse)
+
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    expect(res.statusCode).toBe(409)
+    expect(JSON.parse(res.body)).toEqual({
+      message: 'Looks already booked as purchase 999',
+      qboPurchaseId: '999',
+    })
+  })
+
+  test('conflict (QBO booked, expense skipped meanwhile) → 409 STATE_CONFLICT, NOT an already-booked offer', async () => {
+    const table = installFakeTable(ddbMock, [expenseState, configDefaults])
+    mockFetch(async () => {
+      table.put({ ...table.get(`DOC#${DOC_ID}`, 'state')!, status: 'skipped' })
+      return okQboResponse()
+    })
+
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    expect(res.statusCode).toBe(409)
+    const body = JSON.parse(res.body)
+    expect(body).toMatchObject({ error: 'STATE_CONFLICT', purchaseId: '200' })
+    expect(body).not.toHaveProperty('qboPurchaseId')
+    expect(body.message).toContain('Booked in QBO as purchase 200')
+  })
+
+  test('an explicit empty invoiceNumber clears the stored one (fallback charge key)', async () => {
+    const table = installFakeTable(ddbMock, [
+      { ...expenseState, invoiceNumber: 'WRONG-1' },
+      configDefaults,
+    ])
+    mockFetch(okQboResponse)
+
+    const res = await correctAndSubmit(buildEvent({ ...validBody, invoiceNumber: '' }), ddb)
+
+    expect(res.statusCode).toBe(200)
+    expect(table.get(`DOC#${DOC_ID}`, 'state')).toMatchObject({
+      invoiceNumber: null,
+      chargeKey: 'CHARGE#62#AMT#553.79#2025-09-15',
+    })
+  })
+
+  test('QBO 409 duplicate on an unbooked expense → adopted: 200 linked to the EXISTING purchase', async () => {
+    const table = installFakeTable(ddbMock, [expenseState, configDefaults])
+    mockFetch(
+      async () =>
+        new Response(JSON.stringify({ existing: { id: 'P-EXIST', docNumber: 'D-EX' } }), {
+          status: 409,
+        }),
+    )
+
+    const res = await correctAndSubmit(buildEvent(validBody), ddb)
+
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body)).toMatchObject({ purchaseId: 'P-EXIST' })
+    expect(JSON.parse(res.body).message).toContain('already existed in QBO')
+    expect(table.get(`DOC#${DOC_ID}`, 'state')).toMatchObject({
+      status: 'submitted',
+      qboPurchaseId: 'P-EXIST',
+      vendorName: 'West Coast Pita',
+      invoiceNumber: '3863817',
+      chargeKey: CHARGE_KEY,
+    })
+  })
+
+  test('concurrent identical submits → one QBO purchase, the other gets 409', async () => {
+    installFakeTable(ddbMock, [expenseState, configDefaults])
+    mockFetch(okQboResponse)
+
+    const [a, b] = await Promise.all([
+      correctAndSubmit(buildEvent(validBody), ddb),
+      correctAndSubmit(buildEvent(validBody), ddb),
+    ])
+
+    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 409])
+    expect(global.fetch).toHaveBeenCalledTimes(1)
+  })
+
   // ─── BDK #7 — manual-path PDF attachment ─────────────────────────────────
 
   test('with originalUri on state → attaches PDF best-effort after booking', async () => {
@@ -532,7 +677,7 @@ describe('correctAndSubmit', () => {
       stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
     ).ExpressionAttributeValues
     expect(values?.[':status']).toBe('submitted')
-    expect(values?.[':au']).toBe(true)
+    expect(values?.[':attachmentUploaded']).toBe(true)
   })
 
   test('attach failure does NOT fail the booking (submitted + attachmentFailed)', async () => {
@@ -574,6 +719,6 @@ describe('correctAndSubmit', () => {
       stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
     ).ExpressionAttributeValues
     expect(values?.[':status']).toBe('submitted')
-    expect(values?.[':af']).toBe(true)
+    expect(values?.[':attachmentFailed']).toBe(true)
   })
 })

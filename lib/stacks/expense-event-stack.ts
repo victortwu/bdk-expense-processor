@@ -127,7 +127,6 @@ export class ExpenseEventStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(60),
       environment: {
         TABLE_NAME: table.tableName,
-        PROCESSED_BUCKET: processedBucketName,
         QBO_SERVICE_URL: qboServiceUrl,
         COGNITO_TOKEN_URL: `https://parsely-${stageLower}.auth.${this.region}.amazoncognito.com/oauth2/token`,
         MACHINE_CLIENT_ID: machineClientId,

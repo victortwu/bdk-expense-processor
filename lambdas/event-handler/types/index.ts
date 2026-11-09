@@ -1,3 +1,12 @@
+import type {
+  NeedsInputType,
+  ParsedLine,
+  QboPayload,
+  ValidationError,
+} from '../../shared/expense/types'
+import type { QboRef } from '../../shared/qbo/types'
+import type { AmountInput } from '../../shared/utils/parseAmount'
+
 // ─── Event Payload ─────────────────────────────────────────────────────────
 
 export interface DocumentProcessedDetail {
@@ -8,29 +17,12 @@ export interface DocumentProcessedDetail {
   vendorName: string
   vendorDisplay: string
   documentDate: string
-  amounts: number[]
+  amounts: AmountInput[]
   description: string
   confidence: string
   source: string
   extractedTextUri: string
   originalUri?: string
-}
-
-// ─── QBO Types ─────────────────────────────────────────────────────────────
-
-export interface QboRef {
-  value: string
-  name: string
-}
-
-export interface QboPayload {
-  docNumber: string
-  txnDate: string
-  paymentType: string
-  paymentAccountRef: QboRef
-  entityRef: QboRef
-  lines: ParsedLine[]
-  privateNote: string
 }
 
 // ─── Rules & Config ────────────────────────────────────────────────────────
@@ -73,60 +65,12 @@ export interface ConfigDefaults {
 
 // ─── Strategy Results ──────────────────────────────────────────────────────
 
-export interface ParsedLine {
-  amount: number
-  accountRef: QboRef
-  description: string
-}
-
-export interface ValidationError {
-  field: string
-  reason: string
-  value?: string
-}
-
-export type NeedsInputType =
-  'new_vendor' | 'pick_expense_account' | 'unmatched_items' | 'math_error'
-
 export interface RuleResult {
   status: 'ready' | 'needs_input'
   parsedLines?: ParsedLine[]
   validationErrors?: ValidationError[]
   needsInputType?: NeedsInputType
   qboPayload?: QboPayload
-}
-
-// ─── Expense State ─────────────────────────────────────────────────────────
-
-export interface ExpenseState {
-  pk: string
-  sk: string
-  tenantId: string
-  documentId: string
-  status: string
-  vendorName: string
-  vendorDisplay?: string
-  documentDate: string
-  amounts: number[]
-  description?: string
-  // Source PDF S3 URI (s3://…/original.pdf). Persisted by the event-handler so
-  // manual booking paths can attach the same PDF (BDK #7).
-  originalUri?: string
-  parsedLines?: ParsedLine[]
-  validationErrors?: ValidationError[]
-  needsInputType?: NeedsInputType
-  qboDocNumber?: string
-  qboPurchaseId?: string
-  qboVendorRef?: QboRef
-  attachmentUploaded?: boolean
-  attachmentFailed?: boolean
-  submittedAt?: string
-  failedAt?: string
-  failureReason?: string
-  lastAttempt?: string
-  attempts: number
-  createdAt: string
-  updatedAt: string
 }
 
 // ─── Notification Events ───────────────────────────────────────────────────

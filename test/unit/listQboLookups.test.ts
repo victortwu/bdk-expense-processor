@@ -6,7 +6,7 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 process.env.TABLE_NAME = 'test-expense-table'
 process.env.QBO_SERVICE_URL = 'https://qbo-service.test'
 
-jest.mock('../../lambdas/api/utils/getAuthToken', () => ({
+jest.mock('../../lambdas/shared/auth/getAuthToken', () => ({
   getAuthToken: jest.fn().mockResolvedValue('test-token'),
 }))
 

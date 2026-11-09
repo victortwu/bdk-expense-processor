@@ -94,7 +94,6 @@ export class ExpenseApiStack extends cdk.Stack {
       environment: {
         TABLE_NAME: tableName,
         QBO_SERVICE_URL: qboServiceUrl,
-        PROCESSED_BUCKET: processedBucketName,
         COGNITO_TOKEN_URL: `https://parsely-${stageName.toLowerCase()}.auth.${this.region}.amazoncognito.com/oauth2/token`,
         MACHINE_CLIENT_ID: machineClientId,
         MACHINE_CLIENT_SECRET: machineClientSecret,

@@ -16,12 +16,7 @@
  */
 import { mockClient } from 'aws-sdk-client-mock'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import {
-  DynamoDBDocumentClient,
-  GetCommand,
-  PutCommand,
-  UpdateCommand,
-} from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb'
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge'
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, SQSEvent, Context } from 'aws-lambda'
@@ -34,7 +29,7 @@ process.env.MACHINE_CLIENT_ID = 'test-client-id'
 process.env.MACHINE_CLIENT_SECRET = 'test-client-secret'
 
 // Manual-path auth: mock the API Lambda's getAuthToken.
-jest.mock('../../lambdas/api/utils/getAuthToken', () => ({
+jest.mock('../../lambdas/shared/auth/getAuthToken', () => ({
   getAuthToken: jest.fn().mockResolvedValue('test-token'),
 }))
 // Automated-path Stage-2 classifier: controlled per test. Stage 3 stays real.
@@ -43,9 +38,11 @@ jest.mock('../../lambdas/event-handler/intent/classifyIntent', () => ({
 }))
 
 import { setAccount } from '../../lambdas/api/handlers/setAccount'
+import { submitExpenses } from '../../lambdas/api/handlers/submitExpenses'
 import { handler } from '../../lambdas/event-handler/index'
 import { classifyIntent } from '../../lambdas/event-handler/intent/classifyIntent'
 import type { IntentResult } from '../../lambdas/event-handler/intent/types'
+import { installFakeTable } from '../helpers/fakeTable'
 import { CANONICAL_DOCUMENT_PROCESSED_DETAIL } from '../fixtures/documentProcessedEvent.contract'
 
 const classifyIntentMock = classifyIntent as jest.MockedFunction<typeof classifyIntent>
@@ -70,8 +67,9 @@ const VENDOR_RULE = {
   autoSubmit: true,
 }
 
-// In-memory table shared across both handlers. Keyed by `${pk}|${sk}`.
-const store = new Map<string, Record<string, unknown>>()
+// In-memory table (real conditional semantics) shared across both handlers.
+let table: ReturnType<typeof installFakeTable>
+const store = { get: (k: string) => table.store.get(k) }
 const keyOf = (pk: unknown, sk: unknown) => `${String(pk)}|${String(sk)}`
 
 const expenseState = {
@@ -158,7 +156,6 @@ const makeIntent = (over: Partial<IntentResult>): IntentResult => ({
 })
 
 beforeEach(() => {
-  store.clear()
   ddbMock.reset()
   s3Mock.reset()
   ebMock.reset()
@@ -166,46 +163,7 @@ beforeEach(() => {
   classifyIntentMock.mockReset()
   installFetchMock()
 
-  // Seed the shared store.
-  store.set(keyOf(expenseState.pk, expenseState.sk), { ...expenseState })
-  store.set(keyOf(configDefaults.pk, configDefaults.sk), { ...configDefaults })
-  store.set(keyOf('RULE#franz-bakery', 'v0'), { ...VENDOR_RULE })
-
-  // Map-backed Get/Put/Update over the shared store.
-  ddbMock.on(GetCommand).callsFake((input: { Key?: { pk?: unknown; sk?: unknown } }) => {
-    const item = store.get(keyOf(input.Key?.pk, input.Key?.sk))
-    return Promise.resolve(item ? { Item: item } : {})
-  })
-  ddbMock.on(PutCommand).callsFake((input: { Item?: Record<string, unknown>; ConditionExpression?: string }) => {
-    const item = input.Item!
-    const k = keyOf(item.pk, item.sk)
-    const cond = input.ConditionExpression ?? ''
-    // Marker write: strict attribute_not_exists(pk) — reject if the key exists.
-    if (cond === 'attribute_not_exists(pk)' && store.has(k)) {
-      const err = new Error('exists') as Error & { name: string }
-      err.name = 'ConditionalCheckFailedException'
-      return Promise.reject(err)
-    }
-    // State write: 'attribute_not_exists(pk) OR #status <> :skipped' — reject only
-    // when an existing item is user-skipped.
-    if (cond.includes('<> :skipped')) {
-      const existing = store.get(k)
-      if (existing && existing.status === 'skipped') {
-        const err = new Error('skipped') as Error & { name: string }
-        err.name = 'ConditionalCheckFailedException'
-        return Promise.reject(err)
-      }
-    }
-    store.set(k, item)
-    return Promise.resolve({})
-  })
-  ddbMock.on(UpdateCommand).callsFake((input: { Key?: { pk?: unknown; sk?: unknown } }) => {
-    // Mark the manual-submit expense as submitted so a reprocess reads the new status.
-    const k = keyOf(input.Key?.pk, input.Key?.sk)
-    const existing = store.get(k) ?? {}
-    store.set(k, { ...existing, status: 'submitted' })
-    return Promise.resolve({})
-  })
+  table = installFakeTable(ddbMock, [expenseState, configDefaults, VENDOR_RULE])
 
   // Extracted text present so the event-handler runs Stage 2.
   s3Mock.on(GetObjectCommand).resolves({
@@ -233,7 +191,7 @@ describe('cross-path dedup regression (manual submit → automated reprocess)', 
     // resetting the DOC# state to a reprocessable status (failed). The marker
     // persists — that is what must trigger skip_duplicate.
     const docKey = keyOf(`DOC#${DOC_ID}`, 'state')
-    store.set(docKey, { ...store.get(docKey), status: 'failed' })
+    table.put({ ...store.get(docKey)!, status: 'failed' })
 
     classifyIntentMock.mockResolvedValue(
       makeIntent({ financialIntent: 'bill', invoiceNumber: INVOICE, intentConfidence: 'high' }),
@@ -246,5 +204,97 @@ describe('cross-path dedup regression (manual submit → automated reprocess)', 
     const finalState = store.get(docKey)
     expect(finalState?.status).toBe('skipped')
     expect(String(finalState?.failureReason)).toContain('P-MANUAL')
+  })
+})
+
+describe('pipeline state is complete enough for every manual path (B1, B2, B5)', () => {
+  const postedPayloads = (): Array<{ entityRef: { value: string } }> =>
+    (global.fetch as jest.Mock).mock.calls
+      .filter(([url, init]) => String(url).includes('/purchases') && init?.method === 'POST')
+      .map(([, init]) => JSON.parse(String(init.body)))
+
+  const runPipeline = () => {
+    classifyIntentMock.mockResolvedValue(
+      makeIntent({ financialIntent: 'bill', invoiceNumber: INVOICE, intentConfidence: 'high' }),
+    )
+    return handler(buildSqsEvent(CANONICAL_DOCUMENT_PROCESSED_DETAIL), {} as Context, () => {})
+  }
+
+  it('B1+B2: an autoSubmit=false row persists invoiceNumber/chargeKey/qboPayload, and bulk Submit books it under the pipeline key', async () => {
+    table.store.delete(keyOf(expenseState.pk, expenseState.sk))
+    table.put({ ...VENDOR_RULE, autoSubmit: false })
+
+    await runPipeline()
+
+    const key = `CHARGE#${VENDOR_ID}#INV#${INVOICE}`
+    const ready = table.get(`DOC#${DOC_ID}`, 'state')!
+    expect(ready).toMatchObject({ status: 'ready', invoiceNumber: INVOICE, chargeKey: key })
+    expect(ready.qboPayload).toBeDefined()
+    expect(purchasePostCount()).toBe(0)
+
+    const res = await submitExpenses(buildApiEvent({ documentIds: [DOC_ID] }), ddb)
+
+    expect(JSON.parse(res.body)).toMatchObject({ submitted: 1, failed: 0 })
+    expect(purchasePostCount()).toBe(1)
+    expect(table.get(key, 'marker')).toMatchObject({ documentId: DOC_ID, qboPurchaseId: 'P-MANUAL' })
+    expect(table.get(`DOC#${DOC_ID}`, 'state')).toMatchObject({ status: 'submitted', chargeKey: key })
+  })
+
+  it('autoSubmit=true: the booked state carries invoiceNumber, chargeKey and the payload too', async () => {
+    table.store.delete(keyOf(expenseState.pk, expenseState.sk))
+
+    await runPipeline()
+
+    expect(table.get(`DOC#${DOC_ID}`, 'state')).toMatchObject({
+      status: 'submitted',
+      invoiceNumber: INVOICE,
+      chargeKey: `CHARGE#${VENDOR_ID}#INV#${INVOICE}`,
+      qboPurchaseId: 'P-MANUAL',
+    })
+    expect(table.get(`DOC#${DOC_ID}`, 'state')!.qboPayload).toBeDefined()
+    expect(table.get(`DOC#${DOC_ID}`, 'state')).not.toHaveProperty('failureReason')
+  })
+
+  it('B5: after approveVendor the pipeline books against the stored vendor ref (no re-resolve by name)', async () => {
+    // the rule has no deterministic vendor ref → without the stored ref this would fuzzy-resolve by name
+    table.put({ ...VENDOR_RULE, qboVendorRef: undefined })
+    table.put({
+      ...expenseState,
+      status: 'pending_validation',
+      needsInputType: undefined,
+      qboVendorRef: { value: '77', name: 'Approved Vendor' },
+    })
+
+    await runPipeline()
+
+    expect(postedPayloads()[0].entityRef.value).toBe('77')
+    expect(table.get(`DOC#${DOC_ID}`, 'state')).toMatchObject({
+      status: 'submitted',
+      qboVendorRef: { value: '77', name: 'Approved Vendor' },
+    })
+  })
+
+  it('B8: a record that became submitted/skipped while the pipeline ran is never overwritten', async () => {
+    table.store.delete(keyOf(expenseState.pk, expenseState.sk))
+    table.put({ ...VENDOR_RULE, autoSubmit: false })
+    ;(global.fetch as jest.Mock).mockClear()
+
+    // the state the pipeline reads is "failed" (reprocessable); a human skips it before the write
+    table.put({ ...expenseState, status: 'failed' })
+    const realGet = table.get
+    let reads = 0
+    ddbMock.on(GetCommand).callsFake(async (input: { Key: { pk: string; sk: string } }) => {
+      const item = realGet(input.Key.pk, input.Key.sk)
+      if (input.Key.sk === 'state' && ++reads === 1) {
+        const snapshot = item && { ...item }
+        table.put({ ...expenseState, status: 'skipped' })
+        return snapshot ? { Item: snapshot } : {}
+      }
+      return item ? { Item: { ...item } } : {}
+    })
+
+    await runPipeline()
+
+    expect(table.get(`DOC#${DOC_ID}`, 'state')!.status).toBe('skipped')
   })
 })

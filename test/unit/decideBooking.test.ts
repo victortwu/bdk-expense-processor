@@ -7,10 +7,8 @@
  * of Bedrock. (The LLM's accuracy at producing the intent is measured separately
  * by the real-Bedrock eval.)
  */
-import {
-  decideBooking,
-  chargeKey,
-} from '../../lambdas/event-handler/intent/decideBooking'
+import { decideBooking } from '../../lambdas/event-handler/intent/decideBooking'
+import { chargeKey } from '../../lambdas/shared/keys'
 import { DecisionInput, FinancialIntent } from '../../lambdas/event-handler/intent/types'
 
 const noExisting = () => undefined

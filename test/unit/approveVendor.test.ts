@@ -13,7 +13,7 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 process.env.TABLE_NAME = 'test-expense-table'
 process.env.QBO_SERVICE_URL = 'https://qbo-service.test'
 
-jest.mock('../../lambdas/api/utils/getAuthToken', () => ({
+jest.mock('../../lambdas/shared/auth/getAuthToken', () => ({
   getAuthToken: jest.fn().mockResolvedValue('test-token'),
 }))
 
@@ -57,10 +57,11 @@ describe('approveVendor', () => {
     const [url, init] = (global.fetch as jest.Mock).mock.calls[0]
     expect(url).toBe('https://qbo-service.test/vendors')
     expect(init.headers.Authorization).toBe('Bearer test-token')
-    expect(stateUpdate()?.ExpressionAttributeValues?.[':vendorRef']).toEqual({
+    expect(stateUpdate()?.ExpressionAttributeValues?.[':qboVendorRef']).toEqual({
       value: '77',
       name: 'Acme',
     })
+    expect(JSON.parse(res.body).message).toContain('created')
   })
 
   test('QBO 409 duplicate → adopts the existing vendor', async () => {
@@ -75,7 +76,9 @@ describe('approveVendor', () => {
 
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).vendor).toMatchObject({ id: '12', displayName: 'Acme' })
-    expect(stateUpdate()?.ExpressionAttributeValues?.[':vendorRef']).toEqual({
+    // the message tells the truth: the vendor was adopted, not created
+    expect(JSON.parse(res.body).message).toContain('already exists')
+    expect(stateUpdate()?.ExpressionAttributeValues?.[':qboVendorRef']).toEqual({
       value: '12',
       name: 'Acme',
     })
@@ -109,10 +112,12 @@ describe('approveVendor', () => {
     const res = await approveVendor(buildEvent({ documentId: DOC_ID, vendorName: 'Acme' }), ddb)
 
     expect(res.statusCode).toBe(200)
-    expect(stateUpdate()?.ExpressionAttributeValues?.[':vendorRef']).toEqual({
+    expect(stateUpdate()?.ExpressionAttributeValues?.[':qboVendorRef']).toEqual({
       value: '12',
       name: 'ACME',
     })
+    // the displayed vendor follows the adopted QBO vendor (B5)
+    expect(stateUpdate()?.ExpressionAttributeValues?.[':vendorDisplay']).toBe('ACME')
   })
 
   test('QBO 401 → 502 and no state update', async () => {

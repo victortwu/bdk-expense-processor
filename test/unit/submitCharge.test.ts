@@ -5,16 +5,19 @@
  * HTTP call (injected fetchImpl), getAuthToken + attachPdf (injected deps).
  *
  * Covers:
- *   - success (2xx) → status submitted + writes the CHARGE# marker
- *   - 409 → success + surfaces the EXISTING purchase id/docNumber
- *   - non-2xx → failed + error + intuitTid captured
+ *   - success (2xx) → status submitted + reserves, then finalizes, the CHARGE# marker
+ *   - 409 → `duplicate` (never a new booking) surfacing the EXISTING purchase id/docNumber
+ *   - marker already held → `duplicate` without any QBO call; override bypasses the reservation
+ *   - stale (orphaned) reservations are taken over; fresh ones are respected
+ *   - non-2xx → failed + error + intuitTid captured, reservation released
  *   - attach failure → attachmentFailed, booking still intact (status submitted)
  *   - no chargeKey → no marker write
  */
 import { mockClient } from 'aws-sdk-client-mock'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
 import { submitCharge, SubmitChargeDeps } from '../../lambdas/shared/booking/submitCharge'
+import { installFakeTable } from '../helpers/fakeTable'
 
 const ddbMock = mockClient(DynamoDBDocumentClient)
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: 'us-west-2' }))
@@ -47,16 +50,15 @@ const baseDeps = (
   ...over,
 })
 
-const getMarker = (): Record<string, unknown> | undefined => {
-  const put = ddbMock
-    .commandCalls(PutCommand)
-    .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
-  return put?.args[0].input.Item as Record<string, unknown> | undefined
-}
+let table: ReturnType<typeof installFakeTable>
+
+/** The first marker in the table (undefined when none — e.g. a released reservation). */
+const getMarker = (): Record<string, unknown> | undefined =>
+  [...table.store.values()].find((i) => i.sk === 'marker')
 
 beforeEach(() => {
   ddbMock.reset()
-  ddbMock.on(PutCommand).resolves({})
+  table = installFakeTable(ddbMock)
 })
 
 describe('submitCharge', () => {
@@ -105,7 +107,7 @@ describe('submitCharge', () => {
     expect(marker?.documentDate).toBe('2026-01-02')
   })
 
-  it('409 → success surfacing the EXISTING purchase id/docNumber', async () => {
+  it('409 → duplicate (not a booking) surfacing the EXISTING purchase id/docNumber', async () => {
     const fetchImpl = jest
       .fn()
       .mockResolvedValue(
@@ -125,8 +127,9 @@ describe('submitCharge', () => {
     )
 
     expect(result).toMatchObject({
-      success: true,
-      status: 'submitted',
+      success: false,
+      status: 'duplicate',
+      duplicateSource: 'qbo',
       qboPurchaseId: 'EXISTING-9',
       qboDocNumber: 'DOC-9',
     })
@@ -158,7 +161,7 @@ describe('submitCharge', () => {
     expect(result.error).toContain('QBO API error 400')
     expect(result.intuitTid).toBe('tid-abc')
     expect(result.errorCode).toBeUndefined()
-    // Failed booking → NO marker.
+    // Failed booking → the reservation is released, NO marker remains.
     expect(getMarker()).toBeUndefined()
   })
 
@@ -186,7 +189,7 @@ describe('submitCharge', () => {
     expect(result.status).toBe('failed')
     expect(result.errorCode).toBe('QBO_AUTH_EXPIRED')
     expect(result.intuitTid).toBe('tid-401')
-    // Failed booking → NO marker.
+    // Failed booking → the reservation is released, NO marker remains.
     expect(getMarker()).toBeUndefined()
   })
 
@@ -255,5 +258,76 @@ describe('submitCharge', () => {
 
     expect(result.success).toBe(true)
     expect(getMarker()).toBeUndefined()
+  })
+
+  describe('reservation', () => {
+    const input = {
+      qboPayload: {},
+      documentId: 'DOC-R',
+      chargeKey: 'CHARGE#55#INV#INV-R',
+      vendorId: '55',
+      invoiceNumber: 'INV-R',
+    }
+    const ok = () =>
+      jest
+        .fn()
+        .mockResolvedValue(
+          makeResponse({ status: 200, body: { id: 'P-R', docNumber: 'D-R' } }),
+        ) as unknown as typeof fetch
+
+    it('marker already booked → duplicate from the marker, QBO never called', async () => {
+      table.put({ pk: input.chargeKey, sk: 'marker', documentId: 'OTHER', qboPurchaseId: 'P-OLD' })
+      const fetchImpl = ok()
+
+      const result = await submitCharge(input, ddb, baseDeps(fetchImpl))
+
+      expect(result).toMatchObject({
+        status: 'duplicate',
+        duplicateSource: 'marker',
+        qboPurchaseId: 'P-OLD',
+      })
+      expect(fetchImpl).not.toHaveBeenCalled()
+    })
+
+    it('fresh in-flight reservation is respected (duplicate, no purchase id yet)', async () => {
+      table.put({
+        pk: input.chargeKey,
+        sk: 'marker',
+        documentId: 'OTHER',
+        reservedAt: new Date().toISOString(),
+      })
+      const fetchImpl = ok()
+
+      const result = await submitCharge(input, ddb, baseDeps(fetchImpl))
+
+      expect(result).toMatchObject({ status: 'duplicate', duplicateSource: 'marker' })
+      expect(result.qboPurchaseId).toBeUndefined()
+      expect(fetchImpl).not.toHaveBeenCalled()
+    })
+
+    it('stale (orphaned) reservation is taken over', async () => {
+      table.put({
+        pk: input.chargeKey,
+        sk: 'marker',
+        documentId: 'CRASHED',
+        reservedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      })
+
+      const result = await submitCharge(input, ddb, baseDeps(ok()))
+
+      expect(result.status).toBe('submitted')
+      expect(getMarker()).toMatchObject({ documentId: 'DOC-R', qboPurchaseId: 'P-R' })
+    })
+
+    it('override bypasses the reservation but never clobbers a booked marker', async () => {
+      table.put({ pk: input.chargeKey, sk: 'marker', documentId: 'OTHER', qboPurchaseId: 'P-OLD' })
+      const fetchImpl = ok()
+
+      const result = await submitCharge({ ...input, override: true }, ddb, baseDeps(fetchImpl))
+
+      expect(result.status).toBe('submitted')
+      expect(fetchImpl).toHaveBeenCalledTimes(1)
+      expect(getMarker()?.qboPurchaseId).toBe('P-OLD')
+    })
   })
 })

@@ -1,12 +1,9 @@
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
+import { ScanCommand } from '@aws-sdk/lib-dynamodb'
+import { ApiHandler, respond } from '../../shared/http/respond'
+import { RULE_PREFIX } from '../../shared/keys'
 import { TABLE_NAME } from '../constants'
 
-export const listRules = async (
-  _event: APIGatewayProxyEventV2WithJWTAuthorizer,
-  ddbClient: DynamoDBDocumentClient,
-) => {
+export const listRules: ApiHandler = async (_event, ddbClient) => {
   try {
     const items: Record<string, unknown>[] = []
     let lastEvaluatedKey: Record<string, unknown> | undefined
@@ -17,7 +14,7 @@ export const listRules = async (
           TableName: TABLE_NAME,
           FilterExpression: 'begins_with(pk, :pkPrefix) AND sk = :sk',
           ExpressionAttributeValues: {
-            ':pkPrefix': 'RULE#',
+            ':pkPrefix': RULE_PREFIX,
             ':sk': 'v0',
           },
           ExclusiveStartKey: lastEvaluatedKey,

@@ -1,21 +1,20 @@
-import { COGNITO_TOKEN_URL, MACHINE_CLIENT_ID, MACHINE_CLIENT_SECRET } from '../constants'
-
 let cachedToken: string | null = null
 let tokenExpiresAt = 0
 
 /**
- * Gets a valid machine-to-machine JWT token via Cognito client credentials grant.
- * Caches the token for the Lambda invocation lifetime (reused across SQS batch records).
- * Token is refreshed when within 5 minutes of expiry.
+ * Machine-to-machine JWT (Cognito client-credentials grant) for server-side calls to the
+ * JWT-protected QBO Service. Cached per container, refreshed 5 minutes before expiry.
+ * Config is read from the environment at call time so every Lambda shares this one helper.
  */
 export const getAuthToken = async (): Promise<string> => {
   const now = Date.now()
-  const bufferMs = 5 * 60 * 1000 // 5 minute buffer
+  const bufferMs = 5 * 60 * 1000
 
   if (cachedToken && now < tokenExpiresAt - bufferMs) {
     return cachedToken
   }
 
+  const { COGNITO_TOKEN_URL, MACHINE_CLIENT_ID, MACHINE_CLIENT_SECRET } = process.env
   if (!COGNITO_TOKEN_URL || !MACHINE_CLIENT_ID || !MACHINE_CLIENT_SECRET) {
     throw new Error('Missing Cognito auth configuration (TOKEN_URL, CLIENT_ID, or CLIENT_SECRET)')
   }

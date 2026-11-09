@@ -1,12 +1,9 @@
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
+import { QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb'
+import { ApiHandler, respond } from '../../shared/http/respond'
+import { DOC_PREFIX } from '../../shared/keys'
 import { TABLE_NAME } from '../constants'
 
-export const listExpenses = async (
-  event: APIGatewayProxyEventV2WithJWTAuthorizer,
-  ddbClient: DynamoDBDocumentClient,
-) => {
+export const listExpenses: ApiHandler = async (event, ddbClient) => {
   const status = event.queryStringParameters?.status
   const limit = parseInt(event.queryStringParameters?.limit || '50', 10)
   const nextToken = event.queryStringParameters?.nextToken
@@ -33,7 +30,7 @@ export const listExpenses = async (
           new ScanCommand({
             TableName: TABLE_NAME,
             FilterExpression: 'begins_with(pk, :pkPrefix) AND sk = :sk',
-            ExpressionAttributeValues: { ':pkPrefix': 'DOC#', ':sk': 'state' },
+            ExpressionAttributeValues: { ':pkPrefix': DOC_PREFIX, ':sk': 'state' },
             Limit: limit,
             ExclusiveStartKey: startKey,
           }),

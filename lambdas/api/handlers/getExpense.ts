@@ -1,12 +1,8 @@
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
+import { expenseRepo } from '../../shared/expense/expenseRepo'
+import { ApiHandler, respond } from '../../shared/http/respond'
 import { TABLE_NAME } from '../constants'
 
-export const getExpense = async (
-  event: APIGatewayProxyEventV2WithJWTAuthorizer,
-  ddbClient: DynamoDBDocumentClient,
-) => {
+export const getExpense: ApiHandler = async (event, ddbClient) => {
   const documentId = event.pathParameters?.documentId
 
   if (!documentId) {
@@ -14,18 +10,13 @@ export const getExpense = async (
   }
 
   try {
-    const result = await ddbClient.send(
-      new GetCommand({
-        TableName: TABLE_NAME,
-        Key: { pk: `DOC#${documentId}`, sk: 'state' },
-      }),
-    )
+    const expense = await expenseRepo(ddbClient, TABLE_NAME).get(documentId)
 
-    if (!result.Item) {
+    if (!expense) {
       return respond(404, { message: `Expense not found: ${documentId}` })
     }
 
-    return respond(200, result.Item)
+    return respond(200, expense)
   } catch (err) {
     console.error('Error getting expense:', err)
     return respond(500, { message: 'Failed to get expense' })

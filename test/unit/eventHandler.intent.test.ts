@@ -36,6 +36,7 @@ jest.mock('../../lambdas/event-handler/intent/classifyIntent', () => ({
 }))
 
 import { CANONICAL_DOCUMENT_PROCESSED_DETAIL } from '../fixtures/documentProcessedEvent.contract'
+import { writtenMarker, writtenState } from '../helpers/writtenState'
 import { handler } from '../../lambdas/event-handler/index'
 import { classifyIntent } from '../../lambdas/event-handler/intent/classifyIntent'
 import type { IntentResult } from '../../lambdas/event-handler/intent/types'
@@ -88,19 +89,9 @@ const buildSqsEvent = (detail: Record<string, unknown>): SQSEvent =>
 const invoke = (detail: Record<string, unknown>) =>
   handler(buildSqsEvent(detail), {} as Context, () => {})
 
-const getWrittenState = (): Record<string, unknown> | undefined => {
-  const statePut = ddbMock
-    .commandCalls(PutCommand)
-    .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'state')
-  return statePut?.args[0].input.Item as Record<string, unknown> | undefined
-}
+const getWrittenState = (): Record<string, unknown> | undefined => writtenState(ddbMock)
 
-const getWrittenMarker = (): Record<string, unknown> | undefined => {
-  const markerPut = ddbMock
-    .commandCalls(PutCommand)
-    .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
-  return markerPut?.args[0].input.Item as Record<string, unknown> | undefined
-}
+const getWrittenMarker = (): Record<string, unknown> | undefined => writtenMarker(ddbMock)
 
 const purchaseWasPosted = (): boolean =>
   (global.fetch as jest.Mock).mock.calls.some(

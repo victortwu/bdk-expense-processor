@@ -1,21 +1,13 @@
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
+import { ScanCommand } from '@aws-sdk/lib-dynamodb'
+import { STATS_STATUSES } from '../../shared/expense/status'
+import { ApiHandler, respond } from '../../shared/http/respond'
+import { DOC_PREFIX } from '../../shared/keys'
 import { TABLE_NAME } from '../constants'
 
-export const getStats = async (
-  _event: APIGatewayProxyEventV2WithJWTAuthorizer,
-  ddbClient: DynamoDBDocumentClient,
-) => {
+export const getStats: ApiHandler = async (_event, ddbClient) => {
   try {
-    const stats = {
-      ready: 0,
-      needs_input: 0,
-      submitted: 0,
-      failed: 0,
-      skipped: 0,
-      total: 0,
-    }
+    const stats: Record<string, number> = { total: 0 }
+    for (const status of STATS_STATUSES) stats[status] = 0
 
     let lastEvaluatedKey: Record<string, unknown> | undefined
 
@@ -25,7 +17,7 @@ export const getStats = async (
           TableName: TABLE_NAME,
           FilterExpression: 'begins_with(pk, :pkPrefix) AND sk = :sk',
           ExpressionAttributeValues: {
-            ':pkPrefix': 'DOC#',
+            ':pkPrefix': DOC_PREFIX,
             ':sk': 'state',
           },
           ProjectionExpression: '#status',
@@ -37,7 +29,7 @@ export const getStats = async (
       if (result.Items) {
         for (const item of result.Items) {
           stats.total++
-          const status = item.status as keyof typeof stats
+          const status = item.status as string
           if (status in stats && status !== 'total') {
             stats[status]++
           }

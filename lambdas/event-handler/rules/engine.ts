@@ -1,12 +1,8 @@
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb'
 import { TABLE_NAME } from '../constants'
-import {
-  DocumentProcessedDetail,
-  RuleResult,
-  VendorRule,
-  ConfigDefaults,
-  QboRef,
-} from '../types'
+import { DocumentProcessedDetail, RuleResult, VendorRule, ConfigDefaults } from '../types'
+import { QboRef } from '../../shared/qbo/types'
+import { configDefaultsKey, ruleKey } from '../../shared/keys'
 import { catalogReconcile } from './strategies/catalogReconcile'
 import { amountRange } from './strategies/amountRange'
 import { simpleVendor } from './strategies/simpleVendor'
@@ -23,7 +19,7 @@ export const getConfig = async (ddb: DynamoDBDocumentClient): Promise<ConfigDefa
     const result = await ddb.send(
       new GetCommand({
         TableName: TABLE_NAME,
-        Key: { pk: 'CONFIG#defaults', sk: 'v0' },
+        Key: configDefaultsKey(),
       }),
     )
     if (result.Item) {
@@ -39,13 +35,7 @@ export const getVendorRule = async (
   ddb: DynamoDBDocumentClient,
   vendorName: string,
 ): Promise<VendorRule | null> => {
-  const normalizedName = vendorName.toLowerCase().trim()
-  const result = await ddb.send(
-    new GetCommand({
-      TableName: TABLE_NAME,
-      Key: { pk: `RULE#${normalizedName}`, sk: 'v0' },
-    }),
-  )
+  const result = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: ruleKey(vendorName) }))
   return (result.Item as VendorRule) || null
 }
 

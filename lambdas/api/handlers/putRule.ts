@@ -1,19 +1,29 @@
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
+import { PutCommand } from '@aws-sdk/lib-dynamodb'
+import { ApiHandler, parseJsonBody, respond } from '../../shared/http/respond'
+import { ruleKey } from '../../shared/keys'
+import { QboRef } from '../../shared/qbo/types'
+import { VendorRule } from '../../event-handler/types'
 import { TABLE_NAME } from '../constants'
 
-export const putRule = async (
-  event: APIGatewayProxyEventV2WithJWTAuthorizer,
-  ddbClient: DynamoDBDocumentClient,
-) => {
+type PutRuleBody = Partial<
+  Pick<
+    VendorRule,
+    'ruleType' | 'config' | 'qboVendorRef' | 'autoSubmit' | 'defaultExpenseAccountRef'
+  >
+> & {
+  qboPaymentType?: string
+  qboPaymentAccountRef?: QboRef
+  createdAt?: string
+}
+
+export const putRule: ApiHandler = async (event, ddbClient) => {
   const vendorName = event.pathParameters?.vendorName
 
   if (!vendorName) {
     return respond(400, { message: 'vendorName path parameter is required' })
   }
 
-  const body = JSON.parse(event.body || '{}')
+  const body = parseJsonBody<PutRuleBody>(event)
 
   if (!body.ruleType) {
     return respond(400, { message: 'ruleType is required' })
@@ -27,8 +37,7 @@ export const putRule = async (
 
   try {
     const item = {
-      pk: `RULE#${vendorName}`,
-      sk: 'v0',
+      ...ruleKey(vendorName),
       vendorName,
       ruleType: body.ruleType,
       config: body.config || {},

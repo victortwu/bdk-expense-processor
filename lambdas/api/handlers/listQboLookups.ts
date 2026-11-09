@@ -1,6 +1,5 @@
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
+import { getAuthToken } from '../../shared/auth/getAuthToken'
+import { ApiHandler, respond } from '../../shared/http/respond'
 import { logger } from '../../shared/utils/logger'
 import { QboVendor } from '../../shared/qbo/types'
 import {
@@ -10,7 +9,6 @@ import {
   QBO_VENDORS_CACHE,
 } from '../../shared/qbo/listCache'
 import { QBO_LIST_CACHE_TTL_MS, QBO_SERVICE_URL, TABLE_NAME } from '../constants'
-import { getAuthToken } from '../utils/getAuthToken'
 
 interface LookupConfig<T> {
   cache: { key: { pk: string; sk: string }; field: string }
@@ -26,8 +24,8 @@ interface QboAccount {
 }
 
 const makeListHandler =
-  <T>({ cache, path, toResponse = (items) => items }: LookupConfig<T>) =>
-  async (event: APIGatewayProxyEventV2WithJWTAuthorizer, ddbClient: DynamoDBDocumentClient) => {
+  <T>({ cache, path, toResponse = (items) => items }: LookupConfig<T>): ApiHandler =>
+  async (event, ddbClient) => {
     let authExpired = false
 
     const fetchList = async (): Promise<FetchListResult<T>> => {

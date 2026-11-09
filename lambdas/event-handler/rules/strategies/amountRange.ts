@@ -1,11 +1,5 @@
 import { DocumentProcessedDetail, RuleConfig, RuleResult, VendorRule, ConfigDefaults } from '../../types'
-
-const parseAmount = (raw: string | number): number => {
-  if (typeof raw === 'number') return raw
-  const cleaned = raw.replace(/[$,]/g, '')
-  const parsed = parseFloat(cleaned)
-  return isNaN(parsed) ? 0 : parsed
-}
+import { parseAmount } from '../../../shared/utils/parseAmount'
 
 export const amountRange = (
   detail: DocumentProcessedDetail,

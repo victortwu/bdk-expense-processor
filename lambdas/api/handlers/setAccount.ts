@@ -1,88 +1,57 @@
-import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
-import { respond } from '../../shared/utils/respond'
-import { TABLE_NAME, QBO_SERVICE_URL } from '../constants'
-import { getAuthToken } from '../utils/getAuthToken'
-import { submitCharge } from '../../shared/booking/submitCharge'
-import { attachPdf } from '../utils/attachPdf'
-import { chargeKey, fallbackChargeKey } from '../../event-handler/intent/decideBooking'
+import { bookExpense } from '../../shared/booking/bookExpense'
+import { bookedFromExpense } from '../../shared/booking/bookedFromExpense'
+import { getBookingDeps } from '../../shared/booking/bookingDeps'
+import { buildQboPayload } from '../../shared/booking/buildQboPayload'
+import { expenseRepo } from '../../shared/expense/expenseRepo'
+import { getPaymentAccountRef } from '../../shared/expense/getPaymentAccountRef'
+import { ApiHandler, parseJsonBody, respond } from '../../shared/http/respond'
+import { QboRef } from '../../shared/qbo/types'
+import { parseAmount } from '../../shared/utils/parseAmount'
+import { TABLE_NAME } from '../constants'
+import { respondToBookOutcome } from '../utils/respondToBookOutcome'
 
-/** Parses amount strings like "$2,835.09" or "2835.09" into a number. */
-const parseAmount = (raw: string | number | undefined): number => {
-  if (typeof raw === 'number') return raw
-  if (!raw) return 0
-  const parsed = parseFloat(String(raw).replace(/[$,]/g, ''))
-  return isNaN(parsed) ? 0 : parsed
-}
-
-export const setAccount = async (
-  event: APIGatewayProxyEventV2WithJWTAuthorizer,
-  ddbClient: DynamoDBDocumentClient,
-) => {
-  const body = JSON.parse(event.body || '{}')
-  const { documentId, accountRef } = body as {
-    documentId: string
-    accountRef: { value: string; name: string }
-  }
+/** POST /expenses/set-account — a human picks the expense account; book as a single line. */
+export const setAccount: ApiHandler = async (event, ddb) => {
+  const { documentId, accountRef } = parseJsonBody<{ documentId?: string; accountRef?: QboRef }>(
+    event,
+  )
 
   if (!documentId || !accountRef?.value || !accountRef?.name) {
     return respond(400, { message: 'documentId and accountRef (with value and name) are required' })
   }
 
-  // Get current expense state
-  const getResult = await ddbClient.send(
-    new GetCommand({
-      TableName: TABLE_NAME,
-      Key: { pk: `DOC#${documentId}`, sk: 'state' },
-    }),
-  )
-
-  if (!getResult.Item) {
+  const expense = await expenseRepo(ddb, TABLE_NAME).get(documentId)
+  if (!expense) {
     return respond(404, { message: 'Expense not found' })
   }
-
-  const expense = getResult.Item
 
   if (expense.needsInputType !== 'pick_expense_account') {
     return respond(400, {
       message: `Expense is not awaiting account selection (current: ${expense.needsInputType})`,
     })
   }
+  if (!expense.qboVendorRef) {
+    return respond(400, { message: 'Expense has no resolved QBO vendor' })
+  }
 
-  // Resolve the payment account from CONFIG#defaults (fall back to the record's
-  // own ref if present). Previously this was hardcoded to a placeholder account,
-  // which caused QBO to reject the purchase.
-  const configResult = await ddbClient.send(
-    new GetCommand({
-      TableName: TABLE_NAME,
-      Key: { pk: 'CONFIG#defaults', sk: 'v0' },
-    }),
-  )
-  const paymentAccountRef = configResult.Item?.paymentAccountRef as
-    { value: string; name: string } | undefined
-
-  if (!paymentAccountRef?.value) {
+  const paymentAccountRef = await getPaymentAccountRef(ddb, TABLE_NAME)
+  if (!paymentAccountRef) {
     return respond(500, {
       message: 'No default payment account configured (CONFIG#defaults.paymentAccountRef missing)',
     })
   }
 
-  // Build QBO payload with the selected account. Amounts are stored as raw
-  // extracted strings (e.g. "$1,234.56") — parse before sending to QBO.
-  const amount = parseAmount(expense.amounts?.[0] as string | number | undefined)
-
+  // Amounts are stored as raw extracted strings (e.g. "$1,234.56").
+  const amount = parseAmount(expense.amounts[0])
   if (amount <= 0) {
-    return respond(400, {
-      message: 'No valid positive amount on this expense to submit',
-    })
+    return respond(400, { message: 'No valid positive amount on this expense to submit' })
   }
 
-  const qboPayload = {
-    docNumber: (expense.documentId as string).slice(0, 21),
-    txnDate: expense.documentDate,
-    paymentType: 'CreditCard',
+  const qboPayload = buildQboPayload({
+    documentId,
+    documentDate: expense.documentDate,
     paymentAccountRef,
-    entityRef: expense.qboVendorRef,
+    vendorRef: expense.qboVendorRef,
     lines: [
       {
         amount,
@@ -91,92 +60,20 @@ export const setAccount = async (
       },
     ],
     privateNote: `Manual account selection: ${expense.description || expense.vendorDisplay}`,
-  }
+  })
 
-  // Compute the dedup charge key with the shared rule so a manual submit writes
-  // the SAME marker the automated event-handler would — closing the double-book
-  // hole. Primary (invoice) key when an invoice number is on the expense state,
-  // else the amount+date fallback.
-  const vendorId = (expense.qboVendorRef as { value?: string } | undefined)?.value ?? ''
-  const invoiceNumber = expense.invoiceNumber as string | undefined
-  const bookingChargeKey = invoiceNumber
-    ? chargeKey(vendorId, invoiceNumber)
-    : fallbackChargeKey(vendorId, amount, (expense.documentDate as string) || '')
-
-  // Source PDF URI persisted on the DOC# state by the event-handler. When present
-  // the shared primitive best-effort attaches the receipt to the QBO purchase (BDK #7).
-  const originalUri = expense.originalUri as string | undefined
-
-  // Submit to QBO through the shared booking primitive (authenticated POST +
-  // 409-as-success + conditional CHARGE# marker + best-effort PDF attach). The
-  // API Lambda supplies its own container-cached getAuthToken + attachPdf (it now
-  // has the processed-bucket read + processing-key decrypt grant — BDK #7).
   try {
-    const now = new Date().toISOString()
-    const result = await submitCharge(
+    const outcome = await bookExpense(
       {
-        qboPayload,
         documentId,
-        chargeKey: bookingChargeKey,
-        vendorId,
-        invoiceNumber,
-        amount,
-        documentDate: (expense.documentDate as string) || '',
-        originalUri,
+        status: expense.status,
+        booked: bookedFromExpense({ ...expense, qboVendorRef: expense.qboVendorRef }, qboPayload),
+        originalUri: expense.originalUri,
       },
-      ddbClient,
-      { getAuthToken, qboServiceUrl: QBO_SERVICE_URL, tableName: TABLE_NAME, attachPdf },
+      ddb,
+      getBookingDeps(),
     )
-
-    if (result.success) {
-      const purchaseId = result.qboPurchaseId
-
-      await ddbClient.send(
-        new UpdateCommand({
-          TableName: TABLE_NAME,
-          Key: { pk: `DOC#${documentId}`, sk: 'state' },
-          UpdateExpression:
-            'SET #status = :status, qboDocNumber = :docNo, qboPurchaseId = :pid, submittedAt = :now, lastAttempt = :now, attempts = attempts + :inc, needsInputType = :nit, validationErrors = :ve, parsedLines = :lines, attachmentUploaded = :au, attachmentFailed = :af, updatedAt = :now',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: {
-            ':status': 'submitted',
-            ':docNo': qboPayload.docNumber,
-            ':pid': purchaseId || '',
-            ':now': now,
-            ':inc': 1,
-            ':nit': null,
-            ':ve': null,
-            ':lines': qboPayload.lines,
-            ':au': result.attachmentUploaded ?? null,
-            ':af': result.attachmentFailed ?? null,
-          },
-        }),
-      )
-
-      return respond(200, {
-        message: 'Expense submitted to QBO',
-        purchaseId,
-        attachmentFailed: result.attachmentFailed,
-      })
-    } else {
-      await ddbClient.send(
-        new UpdateCommand({
-          TableName: TABLE_NAME,
-          Key: { pk: `DOC#${documentId}`, sk: 'state' },
-          UpdateExpression:
-            'SET #status = :status, failedAt = :now, failureReason = :reason, lastAttempt = :now, attempts = attempts + :inc, updatedAt = :now',
-          ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: {
-            ':status': 'failed',
-            ':now': now,
-            ':reason': result.error || 'QBO submission failed',
-            ':inc': 1,
-          },
-        }),
-      )
-
-      return respond(502, { message: `QBO submission failed: ${result.error}` })
-    }
+    return respondToBookOutcome(outcome, 'Expense submitted to QBO', expense.qboPurchaseId)
   } catch (err) {
     console.error('Error submitting expense:', err)
     return respond(500, { message: 'Failed to submit expense' })

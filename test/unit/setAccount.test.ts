@@ -29,7 +29,7 @@ process.env.COGNITO_TOKEN_URL = 'https://cognito.test/oauth2/token'
 process.env.MACHINE_CLIENT_ID = 'test-client-id'
 process.env.MACHINE_CLIENT_SECRET = 'test-client-secret'
 
-jest.mock('../../lambdas/api/utils/getAuthToken', () => ({
+jest.mock('../../lambdas/shared/auth/getAuthToken', () => ({
   getAuthToken: jest.fn().mockResolvedValue('test-token'),
 }))
 
@@ -70,6 +70,7 @@ const mockFetch = (impl: () => Promise<Response>) => {
 
 beforeEach(() => {
   ddbMock.reset()
+  ddbMock.on(GetCommand).resolves({}) // default: no marker (specific mocks below take precedence)
   s3Mock.reset()
   jest.clearAllMocks()
 })
@@ -122,7 +123,8 @@ describe('setAccount', () => {
     // marker. No invoice number on this expense → fallback amount+date key.
     const markerPut = ddbMock
       .commandCalls(PutCommand)
-      .find((c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'marker')
+      .filter((c) => (c.args[0].input as { Item?: { qboPurchaseId?: string } }).Item?.qboPurchaseId)
+      .pop()
     const marker = markerPut?.args[0].input.Item as Record<string, unknown> | undefined
     expect(marker).toBeDefined()
     expect(marker?.pk).toBe('CHARGE#63#AMT#586.37#2025-06-12')
@@ -216,7 +218,7 @@ describe('setAccount', () => {
       stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
     ).ExpressionAttributeValues
     expect(values?.[':status']).toBe('submitted')
-    expect(values?.[':au']).toBe(true)
+    expect(values?.[':attachmentUploaded']).toBe(true)
   })
 
   test('attach failure does NOT fail the booking (submitted + attachmentFailed)', async () => {
@@ -260,6 +262,6 @@ describe('setAccount', () => {
       stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
     ).ExpressionAttributeValues
     expect(values?.[':status']).toBe('submitted')
-    expect(values?.[':af']).toBe(true)
+    expect(values?.[':attachmentFailed']).toBe(true)
   })
 })

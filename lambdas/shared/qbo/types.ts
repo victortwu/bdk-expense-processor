@@ -3,3 +3,8 @@ export interface QboVendor {
   displayName: string
   active?: boolean
 }
+
+export interface QboRef {
+  value: string
+  name: string
+}

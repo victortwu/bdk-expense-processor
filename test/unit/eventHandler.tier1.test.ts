@@ -43,6 +43,7 @@ jest.mock('../../lambdas/event-handler/intent/classifyIntent', () => ({
   })),
 }))
 
+import { writtenState } from '../helpers/writtenState'
 import { handler } from '../../lambdas/event-handler/index'
 import { GetObjectCommand } from '@aws-sdk/client-s3'
 
@@ -78,13 +79,7 @@ const invoke = (detail: Record<string, unknown>) =>
   handler(buildSqsEvent(detail), {} as Context, () => {})
 
 /** Capture the state item written via PutCommand (sk === 'state'). */
-const getWrittenState = (): Record<string, unknown> | undefined => {
-  const puts = ddbMock.commandCalls(PutCommand)
-  const statePut = puts.find(
-    (c) => (c.args[0].input as { Item?: { sk?: string } }).Item?.sk === 'state',
-  )
-  return statePut?.args[0].input.Item as Record<string, unknown> | undefined
-}
+const getWrittenState = (): Record<string, unknown> | undefined => writtenState(ddbMock)
 
 const OAUTH_TOKEN_RESPONSE = { access_token: 'test-token', expires_in: 3600, token_type: 'Bearer' }
 
