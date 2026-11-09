@@ -1,6 +1,6 @@
 import { ScanCommand } from '@aws-sdk/lib-dynamodb'
 import { ApiHandler, respond } from '../../shared/http/respond'
-import { RULE_PREFIX } from '../../shared/keys'
+import { RULE_PREFIX, vendorNameFromRuleKey } from '../../shared/keys'
 import { TABLE_NAME } from '../constants'
 
 export const listRules: ApiHandler = async (_event, ddbClient) => {
@@ -22,7 +22,9 @@ export const listRules: ApiHandler = async (_event, ddbClient) => {
       )
 
       if (result.Items) {
-        items.push(...result.Items)
+        items.push(
+          ...result.Items.map((item) => ({ ...item, vendorName: vendorNameFromRuleKey(item.pk) })),
+        )
       }
       lastEvaluatedKey = result.LastEvaluatedKey as Record<string, unknown> | undefined
     } while (lastEvaluatedKey)

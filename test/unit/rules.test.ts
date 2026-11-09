@@ -6,6 +6,7 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 
 process.env.TABLE_NAME = 'test-expense-table'
 
+import { listRules } from '../../lambdas/api/handlers/listRules'
 import { deleteRule } from '../../lambdas/api/handlers/deleteRule'
 import { putRule } from '../../lambdas/api/handlers/putRule'
 import { getVendorRule } from '../../lambdas/event-handler/rules/engine'
@@ -54,5 +55,20 @@ describe('rules round-trip', () => {
     await putRule(event('Franz Bakery', ruleBody), ddb)
     await putRule(event('FRANZ BAKERY', ruleBody), ddb)
     expect([...table.store.keys()].filter((k) => k.startsWith('RULE#'))).toHaveLength(1)
+  })
+})
+
+describe('listRules', () => {
+  it('derives vendorName from the key, since rule items do not store it', async () => {
+    // arrange
+    ddbMock.on(ScanCommand).resolves({
+      Items: [{ pk: 'RULE#centurylink', sk: 'v0', ruleType: 'amount_range' }],
+    })
+
+    // act
+    const res = (await listRules(event('x'), ddb)) as { body: string }
+
+    // assert
+    expect(JSON.parse(res.body).items[0].vendorName).toBe('centurylink')
   })
 })

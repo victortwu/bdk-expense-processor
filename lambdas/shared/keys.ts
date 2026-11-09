@@ -23,6 +23,9 @@ export const ruleKey = (vendorName: string): TableKey => ({
   sk: 'v0',
 })
 
+/** Inverse of `ruleKey`: rule items carry no vendorName attribute — the name IS the key. */
+export const vendorNameFromRuleKey = (pk: string): string => pk.slice(RULE_PREFIX.length)
+
 export const configDefaultsKey = (): TableKey => ({ pk: 'CONFIG#defaults', sk: 'v0' })
 
 export const cacheKey = (name: string): TableKey => ({ pk: `CACHE#${name}`, sk: 'v0' })
