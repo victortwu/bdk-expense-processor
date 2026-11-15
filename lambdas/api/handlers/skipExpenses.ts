@@ -3,13 +3,20 @@ import { ExpenseStatus } from '../../shared/expense/status'
 import { ApiError, ApiHandler, parseJsonBody, respond } from '../../shared/http/respond'
 import { TABLE_NAME } from '../constants'
 
+const MAX_REASON_LENGTH = 500
+
 export const skipExpenses: ApiHandler = async (event, ddb) => {
-  const { documentIds } = parseJsonBody<{ documentIds?: string[] }>(event)
+  const { documentIds, reason } = parseJsonBody<{
+    documentIds?: string[]
+    reason?: string
+  }>(event)
   if (!Array.isArray(documentIds) || documentIds.length === 0) {
     throw new ApiError(400, 'documentIds array is required')
   }
 
   const repo = expenseRepo(ddb, TABLE_NAME)
+  const skipReason =
+    typeof reason === 'string' ? reason.trim().slice(0, MAX_REASON_LENGTH) || undefined : undefined
   const results: { documentId: string; success: boolean; error?: string }[] = []
 
   for (const documentId of documentIds) {
@@ -18,6 +25,7 @@ export const skipExpenses: ApiHandler = async (event, ddb) => {
       const skipped = await repo.transition(documentId, {
         notFrom: [ExpenseStatus.Submitted],
         to: ExpenseStatus.Skipped,
+        set: { bookingOwner: 'human', skipReason },
       })
       if (skipped) {
         results.push({ documentId, success: true })

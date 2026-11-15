@@ -195,4 +195,40 @@ describe('skipExpenses (B4: status guard)', () => {
     expect(table.get('DOC#r', 'state')!.status).toBe('skipped')
     expect(table.get('DOC#s', 'state')!.status).toBe('submitted')
   })
+
+  it.each(['ready', 'needs_input', 'failed', 'skipped', 'pending_validation'])(
+    'skips a %s expense, marks it human-owned and stores the reason',
+    async (status) => {
+      table = installFakeTable(ddbMock, [expense('x', { status })])
+
+      const res = await skipExpenses(event({ documentIds: ['x'], reason: ' not ours ' }), ddb)
+
+      expect(res.statusCode).toBe(200)
+      expect(table.get('DOC#x', 'state')).toMatchObject({
+        status: 'skipped',
+        bookingOwner: 'human',
+        skipReason: 'not ours',
+      })
+    },
+  )
+
+  it('works without a reason (existing wire shape) and leaves skipReason unset', async () => {
+    table = installFakeTable(ddbMock, [expense('x')])
+
+    await skipExpenses(event({ documentIds: ['x'] }), ddb)
+
+    const state = table.get('DOC#x', 'state')!
+    expect(state).toMatchObject({ status: 'skipped', bookingOwner: 'human' })
+    expect(state).not.toHaveProperty('skipReason')
+  })
+
+  it('refuses a submitted expense per item (200) and leaves it untouched', async () => {
+    table = installFakeTable(ddbMock, [expense('s', { status: 'submitted' })])
+
+    const res = await skipExpenses(event({ documentIds: ['s'], reason: 'x' }), ddb)
+
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).results[0].error).toBe('Cannot skip expense with status: submitted')
+    expect(table.get('DOC#s', 'state')).toEqual(expense('s', { status: 'submitted' }))
+  })
 })

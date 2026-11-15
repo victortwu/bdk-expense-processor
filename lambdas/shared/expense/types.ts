@@ -34,6 +34,10 @@ export interface ExpenseState {
   tenantId: string
   documentId: string
   status: ExpenseStatus
+  /** Who may write this item: absent = pipeline. `human` = the event-handler never touches it. */
+  bookingOwner?: 'pipeline' | 'human'
+  /** Optional reason a human gave when skipping. */
+  skipReason?: string
   vendorName: string
   vendorDisplay?: string
   documentDate: string

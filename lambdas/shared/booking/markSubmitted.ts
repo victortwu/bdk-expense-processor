@@ -16,6 +16,8 @@ export interface BookedExpense {
   amounts: AmountInput[]
   parsedLines: ParsedLine[]
   qboPayload: QboPayload
+  /** Set by human-driven bookings so the pipeline never overwrites them again. */
+  bookingOwner?: 'human'
 }
 
 /** Statuses a booking may leave: every status except an already-booked one. */
@@ -46,6 +48,7 @@ export const markSubmitted = (
     to: ExpenseStatus.Submitted,
     countAttempt: true,
     set: {
+      bookingOwner: booked.bookingOwner,
       vendorName: booked.vendorName,
       vendorDisplay: booked.vendorDisplay ?? booked.vendorName,
       qboVendorRef: booked.vendorRef,

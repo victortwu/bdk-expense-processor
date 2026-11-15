@@ -162,6 +162,7 @@ describe('correctAndSubmit', () => {
       stateUpdate?.args[0].input as { ExpressionAttributeValues?: Record<string, unknown> }
     ).ExpressionAttributeValues
     expect(values?.[':status']).toBe('submitted')
+    expect(values?.[':bookingOwner']).toBe('human')
     expect(values?.[':qboPurchaseId']).toBe('200')
     expect(values?.[':needsInputType']).toBeNull()
   })

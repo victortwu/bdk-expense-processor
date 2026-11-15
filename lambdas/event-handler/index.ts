@@ -49,6 +49,10 @@ export const handler: SQSHandler = async (event) => {
       const existing = await repo.get(documentId)
 
       if (existing) {
+        if (existing.bookingOwner === 'human') {
+          logger.info('Human hold skip', { currentStatus: existing.status })
+          continue
+        }
         const currentStatus = existing.status
         if (currentStatus === ExpenseStatus.Submitted || currentStatus === ExpenseStatus.Skipped) {
           logger.info('Idempotency skip', { currentStatus })

@@ -15,7 +15,7 @@
  * module load).
  */
 import { mockClient } from 'aws-sdk-client-mock'
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
 import { EventBridgeClient, PutEventsCommand } from '@aws-sdk/client-eventbridge'
 import { S3Client } from '@aws-sdk/client-s3'
 import type { SQSEvent, Context } from 'aws-lambda'
@@ -160,6 +160,34 @@ describe('event-handler Tier-1 orchestration', () => {
 
     // assert — short-circuited before any processing; no state write
     expect(getWrittenState()).toBeUndefined()
+  })
+
+  it.each(['ready', 'needs_input', 'failed', 'skipped', 'submitted'])(
+    'human hold: a %s item with bookingOwner=human is neither rewritten nor booked on re-emit',
+    async (status) => {
+      ddbMock
+        .on(GetCommand)
+        .resolves({ Item: { pk: 'DOC#x', sk: 'state', status, bookingOwner: 'human' } })
+      ddbMock.on(PutCommand).resolves({})
+      installFetchMock(() => ({ status: 200, body: {} }))
+
+      await invoke(CANONICAL_DOCUMENT_PROCESSED_DETAIL)
+
+      expect(ddbMock.commandCalls(PutCommand)).toHaveLength(0)
+      expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(0)
+      expect(global.fetch).not.toHaveBeenCalled()
+      expect(ddbMock.commandCalls(GetCommand)).toHaveLength(1) // returned right after the state read
+    },
+  )
+
+  it('no behaviour change without bookingOwner: a failed item is still reprocessed', async () => {
+    ddbMock.on(GetCommand).resolves({ Item: { pk: 'DOC#x', sk: 'state', status: 'failed' } })
+    ddbMock.on(PutCommand).resolves({})
+    installFetchMock(() => ({ status: 200, body: { purchases: [] } }))
+
+    await invoke({ ...CANONICAL_DOCUMENT_PROCESSED_DETAIL, vendorName: 'totally-unknown-vendor' })
+
+    expect(getWrittenState()?.status).toBe('needs_input')
   })
 
   it('deterministic vendor rule (qboVendorRef + amount_range) → submitted, skips fuzzy resolve', async () => {

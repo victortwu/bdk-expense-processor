@@ -166,6 +166,7 @@ export const correctAndSubmit: ApiHandler = async (event, ddb) => {
           amounts: [totalAmount],
           parsedLines,
           qboPayload,
+          bookingOwner: 'human',
         },
       },
       ddb,
