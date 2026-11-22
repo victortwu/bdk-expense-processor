@@ -509,6 +509,7 @@ const bookReady = async (p: BookReadyParams): Promise<void> => {
         await repo.transition(documentId, {
           from: [ExpenseStatus.Ready],
           to: ExpenseStatus.Skipped,
+          unlessHumanOwned: true,
           set: { failureReason: `Duplicate of QBO purchase ${outcome.existingPurchaseId}` },
         })
       }

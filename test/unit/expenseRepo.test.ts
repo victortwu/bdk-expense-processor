@@ -62,6 +62,24 @@ describe('expenseRepo.transition', () => {
     else expect(table.get('DOC#d', 'state')).toBeUndefined()
   })
 
+  it.each<[string, string | undefined, TransitionSpec, boolean]>([
+    ['human-owned, guarded', 'human', { unlessHumanOwned: true, to: Failed }, false],
+    ['human-owned, unguarded (a human acting)', 'human', { to: Failed }, true],
+    ['pipeline-owned, guarded', 'pipeline', { unlessHumanOwned: true, to: Failed }, true],
+    ['unowned, guarded', undefined, { unlessHumanOwned: true, to: Failed }, true],
+  ])('human hold: %s', async (_name, owner, spec, expected) => {
+    table.put({
+      pk: 'DOC#d',
+      sk: 'state',
+      documentId: 'd',
+      status: NeedsInput,
+      bookingOwner: owner,
+    })
+
+    expect(await repo.transition('d', spec)).toBe(expected)
+    expect(current().status).toBe(expected ? 'failed' : 'needs_input')
+  })
+
   it('sets fields (null stores NULL, undefined is ignored), removes fields and counts the attempt', async () => {
     seed(Failed)
 
@@ -102,6 +120,26 @@ describe('expenseRepo writes', () => {
     expect(await repo.replaceUnlessTerminal(stateOf(Ready))).toBe(written)
     expect(current().status).toBe(written ? 'ready' : existing)
   })
+
+  it.each([
+    ['human', false],
+    ['pipeline', true],
+    [undefined, true],
+  ])(
+    'replaceUnlessTerminal over a needs_input item owned by %s → written=%s (human hold)',
+    async (owner, written) => {
+      table.put({
+        pk: 'DOC#d',
+        sk: 'state',
+        documentId: 'd',
+        status: NeedsInput,
+        bookingOwner: owner,
+      })
+
+      expect(await repo.replaceUnlessTerminal(stateOf(Ready))).toBe(written)
+      expect(current().status).toBe(written ? 'ready' : 'needs_input')
+    },
+  )
 
   it('replaceUnlessTerminal creates a missing record', async () => {
     expect(await repo.replaceUnlessTerminal(stateOf(Ready))).toBe(true)

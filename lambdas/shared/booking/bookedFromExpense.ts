@@ -30,4 +30,6 @@ export const bookedFromExpense = (
   amounts: expense.amounts,
   parsedLines: qboPayload.lines,
   qboPayload,
+  // Keep a human's ownership so a bulk submit of their item is not rejected by the pipeline guard.
+  bookingOwner: expense.bookingOwner === 'human' ? 'human' : undefined,
 })

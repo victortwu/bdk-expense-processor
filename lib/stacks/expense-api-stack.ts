@@ -48,6 +48,12 @@ export class ExpenseApiStack extends cdk.Stack {
       this,
       `/${stageName}/datamgmt-qbo/api-url`,
     )
+    // Parsely (document service) API base URL, for POST /expenses/from-document (BDK #13).
+    // Published by the Parsely API stack (or created once by hand) — see docs/e2-from-document-contract.md.
+    const parselyApiUrl = ssm.StringParameter.valueForStringParameter(
+      this,
+      `/${stageName}/datamgmt/api-url`,
+    )
 
     // Import from Event Stack
     const tableName = ssm.StringParameter.valueForStringParameter(
@@ -94,6 +100,7 @@ export class ExpenseApiStack extends cdk.Stack {
       environment: {
         TABLE_NAME: tableName,
         QBO_SERVICE_URL: qboServiceUrl,
+        PARSELY_API_URL: parselyApiUrl,
         COGNITO_TOKEN_URL: `https://parsely-${stageName.toLowerCase()}.auth.${this.region}.amazoncognito.com/oauth2/token`,
         MACHINE_CLIENT_ID: machineClientId,
         MACHINE_CLIENT_SECRET: machineClientSecret,
@@ -185,6 +192,15 @@ export class ExpenseApiStack extends cdk.Stack {
     // no attachPdf → no S3/KMS grant).
     httpApi.addRoutes({
       path: '/expenses/{documentId}/correct-and-submit',
+      methods: [apigwv2.HttpMethod.POST],
+      integration: apiIntegration,
+      authorizer: jwtAuthorizer,
+    })
+
+    // E2 — open-or-create an expense from a Parsely document (BDK #13). No new IAM: the
+    // Parsely fetch is an HTTPS call with the existing machine token; no QBO call.
+    httpApi.addRoutes({
+      path: '/expenses/from-document/{documentId}',
       methods: [apigwv2.HttpMethod.POST],
       integration: apiIntegration,
       authorizer: jwtAuthorizer,

@@ -35,7 +35,7 @@ describe('ExpenseApiStack', () => {
     })
   })
 
-  test('creates all 12 API routes', () => {
+  test('creates all API routes', () => {
     const routes = template.findResources('AWS::ApiGatewayV2::Route')
     const routeKeys = Object.values(routes).map(
       (r: Record<string, unknown>) =>
@@ -50,10 +50,22 @@ describe('ExpenseApiStack', () => {
     expect(routeKeys).toContain('POST /expenses/approve-vendor')
     expect(routeKeys).toContain('POST /expenses/set-account')
     expect(routeKeys).toContain('POST /expenses/{documentId}/correct-and-submit')
+    expect(routeKeys).toContain('POST /expenses/from-document/{documentId}')
     expect(routeKeys).toContain('GET /rules')
     expect(routeKeys).toContain('PUT /rules/{vendorName}')
     expect(routeKeys).toContain('DELETE /rules/{vendorName}')
     expect(routeKeys).toContain('GET /stats')
+  })
+
+  test('API Lambda learns the Parsely API URL from SSM /Beta/datamgmt/api-url', () => {
+    template.hasParameter('*', {
+      Type: 'AWS::SSM::Parameter::Value<String>',
+      Default: '/Beta/datamgmt/api-url',
+    })
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      FunctionName: 'Beta-BDK-ExpenseProcessor-Api',
+      Environment: { Variables: Match.objectLike({ PARSELY_API_URL: Match.anyValue() }) },
+    })
   })
 
   test('writes SSM parameter for API URL', () => {

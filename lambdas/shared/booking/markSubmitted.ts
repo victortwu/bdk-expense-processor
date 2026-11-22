@@ -20,6 +20,10 @@ export interface BookedExpense {
   bookingOwner?: 'human'
 }
 
+/** Only human-driven bookings may write over a human-owned item; every other writer is the pipeline. */
+const isPipelineWrite = (booked: Pick<BookedExpense, 'bookingOwner'>): boolean =>
+  booked.bookingOwner !== 'human'
+
 /** Statuses a booking may leave: every status except an already-booked one. */
 export const BOOKABLE_FROM = [
   ExpenseStatus.Ready,
@@ -46,6 +50,7 @@ export const markSubmitted = (
   return repo.transition(documentId, {
     from,
     to: ExpenseStatus.Submitted,
+    unlessHumanOwned: isPipelineWrite(booked),
     countAttempt: true,
     set: {
       bookingOwner: booked.bookingOwner,
@@ -76,11 +81,13 @@ export const markFailed = (
   repo: ExpenseRepo,
   documentId: string,
   error: string | undefined,
+  booked: Pick<BookedExpense, 'bookingOwner'>,
 ): Promise<boolean> => {
   const now = new Date().toISOString()
   return repo.transition(documentId, {
     notFrom: [ExpenseStatus.Submitted],
     to: ExpenseStatus.Failed,
+    unlessHumanOwned: isPipelineWrite(booked),
     countAttempt: true,
     set: { failedAt: now, failureReason: error || 'QBO submission failed', lastAttempt: now },
   })

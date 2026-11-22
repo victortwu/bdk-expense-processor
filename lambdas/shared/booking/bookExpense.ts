@@ -101,7 +101,7 @@ export const bookExpense = async (
 
   switch (result.status) {
     case 'failed':
-      if (!(await markFailed(repo, documentId, result.error))) {
+      if (!(await markFailed(repo, documentId, result.error, booked))) {
         logger.warn('Booking failed but the failure was not recorded (state changed)', {
           documentId,
           error: result.error,

@@ -297,4 +297,47 @@ describe('bookExpense', () => {
 
     expect(state()).toMatchObject({ vendorDisplay: 'franz-bakery', invoiceNumber: null })
   })
+
+  describe('human hold (pipeline writes never overwrite a human-owned item)', () => {
+    const humanOwned = () => table.put({ ...state(), status: 'needs_input', bookingOwner: 'human' })
+
+    it('a pipeline booking of a human-owned item is a conflict: QBO booked, state untouched', async () => {
+      humanOwned()
+
+      const outcome = await bookExpense(
+        params({ status: ExpenseStatus.NeedsInput }),
+        ddb,
+        created(),
+      )
+
+      expect(outcome.kind).toBe('conflict')
+      expect(state()).toMatchObject({ status: 'needs_input', bookingOwner: 'human' })
+    })
+
+    it('a pipeline FAILURE does not flip a human-owned item to failed', async () => {
+      humanOwned()
+
+      const outcome = await bookExpense(
+        params({ status: ExpenseStatus.NeedsInput }),
+        ddb,
+        deps(() => ({ status: 500, body: 'boom' })),
+      )
+
+      expect(outcome.kind).toBe('failed')
+      expect(state().status).toBe('needs_input')
+    })
+
+    it('a human booking of their own item goes through', async () => {
+      humanOwned()
+
+      const outcome = await bookExpense(
+        params({ status: ExpenseStatus.NeedsInput, booked: { ...booked, bookingOwner: 'human' } }),
+        ddb,
+        created(),
+      )
+
+      expect(outcome.kind).toBe('submitted')
+      expect(state()).toMatchObject({ status: 'submitted', bookingOwner: 'human' })
+    })
+  })
 })

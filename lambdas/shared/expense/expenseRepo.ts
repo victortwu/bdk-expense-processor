@@ -28,7 +28,12 @@ export interface TransitionSpec {
   remove?: readonly (keyof ExpenseState)[]
   /** Bump `attempts` (initialising it if absent). */
   countAttempt?: boolean
+  /** Pipeline writers only: never transition an item a human owns (human hold, D4). */
+  unlessHumanOwned?: boolean
 }
+
+/** Condition fragment shared by every pipeline write: a human-owned item is never touched. */
+const NOT_HUMAN_OWNED = '(attribute_not_exists(#bookingOwner) OR #bookingOwner <> :human)'
 
 const isConditionalFailure = (err: unknown): boolean =>
   (err as { name?: string })?.name === 'ConditionalCheckFailedException'
@@ -68,6 +73,11 @@ export const buildTransition = (spec: TransitionSpec, now: string) => {
   })
 
   const conditions = ['attribute_exists(pk)']
+  if (spec.unlessHumanOwned) {
+    names['#bookingOwner'] = 'bookingOwner'
+    values[':human'] = 'human'
+    conditions.push(NOT_HUMAN_OWNED)
+  }
   const inList = (prefix: string, statuses: readonly ExpenseStatus[]) =>
     statuses
       .map((status, i) => {
@@ -108,7 +118,7 @@ export const expenseRepo = (ddb: DynamoDBDocumentClient, tableName: string) => (
 
   /**
    * Full replace of a pipeline-owned state (reprocess). Never overwrites a record a human
-   * skipped or that already booked (B8) — `false` means it was left untouched.
+   * skipped or owns, or that already booked (B8) — `false` means it was left untouched.
    */
   replaceUnlessTerminal: async (state: ExpenseState): Promise<boolean> => {
     const written = await guarded(() =>
@@ -116,18 +126,20 @@ export const expenseRepo = (ddb: DynamoDBDocumentClient, tableName: string) => (
         new PutCommand({
           TableName: tableName,
           Item: state,
-          ConditionExpression:
-            'attribute_not_exists(pk) OR NOT (#status IN (:skipped, :submitted))',
-          ExpressionAttributeNames: { '#status': 'status' },
+          ConditionExpression: `attribute_not_exists(pk) OR (NOT (#status IN (:skipped, :submitted)) AND ${NOT_HUMAN_OWNED})`,
+          ExpressionAttributeNames: { '#status': 'status', '#bookingOwner': 'bookingOwner' },
           ExpressionAttributeValues: {
             ':skipped': ExpenseStatus.Skipped,
             ':submitted': ExpenseStatus.Submitted,
+            ':human': 'human',
           },
         }),
       ),
     )
     if (!written)
-      logger.info('State not overwritten (skipped or submitted)', { documentId: state.documentId })
+      logger.info('State not overwritten (skipped, submitted or human-owned)', {
+        documentId: state.documentId,
+      })
     return written
   },
 

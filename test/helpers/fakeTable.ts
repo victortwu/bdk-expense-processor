@@ -19,7 +19,7 @@ type Values = Record<string, unknown>
 const ccf = (): Error =>
   Object.assign(new Error('conditional check failed'), { name: 'ConditionalCheckFailedException' })
 
-/** Evaluate a ConditionExpression (OR / AND / NOT / parens / exists / IN / = / <) against `item`. */
+/** Evaluate a ConditionExpression (OR / AND / NOT / parens / exists / IN / = / <> / <) against `item`. */
 export const evalCondition = (
   expr: string,
   item: Item | undefined,
@@ -27,7 +27,7 @@ export const evalCondition = (
   values: Values,
 ): boolean => {
   const tokens =
-    expr.match(/attribute_not_exists|attribute_exists|NOT|AND|OR|IN|[(),=<]|[#:]?[A-Za-z0-9_]+/g) ??
+    expr.match(/attribute_not_exists|attribute_exists|NOT|AND|OR|IN|<>|[(),=<]|[#:]?[A-Za-z0-9_]+/g) ??
     []
   let i = 0
   const attr = (t: string) => item?.[names[t] ?? t]
@@ -79,7 +79,9 @@ export const evalCondition = (
       return list.includes(left)
     }
     const right = operand(tokens[i++])
-    return op === '=' ? left === right : (left as string) < (right as string)
+    if (op === '=') return left === right
+    if (op === '<>') return left !== right
+    return (left as string) < (right as string)
   }
   return parseOr()
 }

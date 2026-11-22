@@ -1,6 +1,7 @@
 import { ApiHandler } from '../shared/http/respond'
 import { approveVendor } from './handlers/approveVendor'
 import { correctAndSubmit } from './handlers/correctAndSubmit'
+import { createExpenseFromDocument } from './handlers/createExpenseFromDocument'
 import { deleteRule } from './handlers/deleteRule'
 import { getExpense } from './handlers/getExpense'
 import { getStats } from './handlers/getStats'
@@ -28,6 +29,11 @@ export const routes: Route[] = [
   { method: 'POST', path: '/expenses/skip', handler: skipExpenses },
   { method: 'POST', path: '/expenses/approve-vendor', handler: approveVendor },
   { method: 'POST', path: '/expenses/set-account', handler: setAccount },
+  {
+    method: 'POST',
+    path: '/expenses/from-document/{documentId}',
+    handler: createExpenseFromDocument,
+  },
   { method: 'GET', path: '/expenses/{documentId}', handler: getExpense },
   { method: 'POST', path: '/expenses/{documentId}/correct-and-submit', handler: correctAndSubmit },
   { method: 'GET', path: '/rules', handler: listRules },

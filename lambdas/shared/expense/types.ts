@@ -55,7 +55,8 @@ export interface ExpenseState {
   /** Prebuilt QBO purchase payload, so ready/failed rows can be (re)submitted in bulk. */
   qboPayload?: QboPayload
   validationErrors?: ValidationError[]
-  needsInputType?: NeedsInputType
+  /** `review`: created by a human from a document (nothing wrong; it awaits their input). */
+  needsInputType?: NeedsInputType | 'review'
   qboDocNumber?: string
   qboPurchaseId?: string
   qboVendorRef?: QboRef

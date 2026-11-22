@@ -82,6 +82,18 @@ describe('submitExpenses (B2: bulk Submit actually books)', () => {
     })
   })
 
+  it('a human-owned ready item can still be bulk-submitted by a human (hold binds only the pipeline)', async () => {
+    table = installFakeTable(ddbMock, [expense('a', { bookingOwner: 'human' })])
+
+    const res = await submitExpenses(event({ documentIds: ['a'] }), ddb)
+
+    expect(JSON.parse(res.body)).toMatchObject({ submitted: 1, failed: 0 })
+    expect(table.get('DOC#a', 'state')).toMatchObject({
+      status: 'submitted',
+      bookingOwner: 'human',
+    })
+  })
+
   it('B1: without a stored chargeKey it derives the invoice key from the stored invoiceNumber', async () => {
     table = installFakeTable(ddbMock, [expense('a', { invoiceNumber: 'INV-8' })])
 
