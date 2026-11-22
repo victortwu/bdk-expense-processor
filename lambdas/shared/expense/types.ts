@@ -15,7 +15,7 @@ export interface ValidationError {
 }
 
 export type NeedsInputType =
-  'new_vendor' | 'pick_expense_account' | 'unmatched_items' | 'math_error'
+  'new_vendor' | 'pick_expense_account' | 'unmatched_items' | 'math_error' | 'review'
 
 export interface QboPayload {
   docNumber: string
@@ -56,7 +56,7 @@ export interface ExpenseState {
   qboPayload?: QboPayload
   validationErrors?: ValidationError[]
   /** `review`: created by a human from a document (nothing wrong; it awaits their input). */
-  needsInputType?: NeedsInputType | 'review'
+  needsInputType?: NeedsInputType
   qboDocNumber?: string
   qboPurchaseId?: string
   qboVendorRef?: QboRef

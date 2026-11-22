@@ -65,6 +65,7 @@ export const approveVendor: ApiHandler = async (event, ddbClient) => {
     const updated = await repo.transition(documentId, {
       notFrom: [ExpenseStatus.Submitted, ExpenseStatus.Skipped],
       to: ExpenseStatus.PendingValidation,
+      unlessHumanOwned: true,
       set: {
         qboVendorRef: vendorRef,
         vendorDisplay: vendorRef.name,

@@ -85,3 +85,6 @@ a 200 with `expense.status === 'submitted'` means the document is already booked
   `https://xloboqgzpb.execute-api.us-west-2.amazonaws.com`. Create it before deploying `Beta-BDK-ExpenseProcessor-Api`
   (a missing parameter fails the CloudFormation deploy before any change is made).
 - New API Gateway route `POST /expenses/from-document/{documentId}` (JWT authorizer). No new IAM.
+- Parsely's `MACHINE_CLIENT_TENANT_MAP` must map the Expense API's machine client (same client as the QBO calls) to the
+  tenant. If it does not, every Parsely call fails and this route returns 502.
+- The frontend must send the Cognito **ID token** (it carries `custom:tenantId`); an access token gets 403.

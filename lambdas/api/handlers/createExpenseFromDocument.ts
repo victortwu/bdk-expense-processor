@@ -29,7 +29,7 @@ export const createExpenseFromDocument: ApiHandler = async (event, ddb) => {
   // the machine token's tenant); any other tenant-less token is refused, never treated as "any".
   const { 'custom:tenantId': callerTenant, client_id: clientId } =
     event.requestContext.authorizer.jwt.claims
-  if (!callerTenant && clientId !== process.env.MACHINE_CLIENT_ID) {
+  if (!callerTenant && (!clientId || clientId !== process.env.MACHINE_CLIENT_ID)) {
     throw new ApiError(403, 'Token has no tenant')
   }
   const visibleToCaller = (tenantId: string) => !callerTenant || callerTenant === tenantId

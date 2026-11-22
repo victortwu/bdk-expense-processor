@@ -114,7 +114,7 @@ export const handler: SQSHandler = async (event) => {
           extractedDate: detail.documentDate,
           extractedSubType: detail.subType,
         })
-        await saveState(
+        const savedNewVendor = await saveState(
           detail,
           {
             status: ExpenseStatus.NeedsInput,
@@ -128,6 +128,8 @@ export const handler: SQSHandler = async (event) => {
           },
           existing,
         )
+        // Rejected (a human hold or a terminal state won): alert nobody about a write that did not happen.
+        if (!savedNewVendor) continue
 
         await emitNotification({
           type: 'new_vendor',
@@ -171,7 +173,12 @@ export const handler: SQSHandler = async (event) => {
 
         if (outcome.action !== 'book') {
           const stateOverride = mapOutcomeToState(outcome)
-          await saveState(detail, { ...stateOverride, qboVendorRef, invoiceNumber }, existing)
+          const savedIntent = await saveState(
+            detail,
+            { ...stateOverride, qboVendorRef, invoiceNumber },
+            existing,
+          )
+          if (!savedIntent) continue
           // Only alert a human when the outcome genuinely needs review. A
           // skip_duplicate / informational outcome is a correct auto-decision —
           // the structured 'Intent decision' log already covers observability,
@@ -513,6 +520,19 @@ const bookReady = async (p: BookReadyParams): Promise<void> => {
           set: { failureReason: `Duplicate of QBO purchase ${outcome.existingPurchaseId}` },
         })
       }
+      return
+    case 'conflict':
+      // QBO holds a purchase but the DOC# write was refused (human hold / skip won the race).
+      logger.error('QBO booked but expense state not recorded', {
+        documentId,
+        qboPurchaseId: outcome.result.qboPurchaseId,
+      })
+      await emitNotification({
+        type: 'submission_failed',
+        documentId,
+        vendorName,
+        message: `Booked in QBO (purchase ${outcome.result.qboPurchaseId}) but the expense state could not be recorded — reconcile manually`,
+      })
       return
     default:
       logger.warn('Booking not recorded', { outcome: outcome.kind })
