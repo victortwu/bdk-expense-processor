@@ -74,17 +74,15 @@ a 200 with `expense.status === 'submitted'` means the document is already booked
 ## Tenant scoping
 
 - A returned document must carry a string `tenantId` and the requested `documentId`, else it is treated as an upstream failure (502).
-- Parsely is called with the Expense API's machine token; Parsely scopes the lookup to that token's tenant.
+- Parsely `GET /documents/{id}` is called with the caller's own `Authorization` JWT (the FE already uses one JWT for both APIs); Parsely's authorizer scopes the lookup to the caller's tenant. No machine token is involved.
 - If the caller's JWT has `custom:tenantId`, it must equal the document's tenant (and, for an existing item, the
-  item's tenant); otherwise 404 (no existence leak). Only the Expense API's own machine client (`client_id` = `MACHINE_CLIENT_ID`) may omit the tenant claim; any other tenant-less token gets 403.
+  item's tenant); otherwise 404 (no existence leak). That comparison is defense in depth. A token without `custom:tenantId` gets 403.
 
 ## Infrastructure (for the deploy)
 
 - New env var on `{Stage}-BDK-ExpenseProcessor-Api`: `PARSELY_API_URL`, read from SSM `/{Stage}/datamgmt/api-url`.
-- That parameter does NOT exist today. It must hold the Parsely HTTP API endpoint without a trailing slash, e.g. Beta:
-  `https://xloboqgzpb.execute-api.us-west-2.amazonaws.com`. Create it before deploying `Beta-BDK-ExpenseProcessor-Api`
-  (a missing parameter fails the CloudFormation deploy before any change is made).
+- That parameter is published by the **Parsely Api stack** (data-management-cdk), as the Parsely HTTP API endpoint without a
+  trailing slash. **Deploy order: Parsely Api stack BEFORE `{Stage}-BDK-ExpenseProcessor-Api`** (a missing parameter fails the
+  CloudFormation deploy before any change is made).
 - New API Gateway route `POST /expenses/from-document/{documentId}` (JWT authorizer). No new IAM.
-- Parsely's `MACHINE_CLIENT_TENANT_MAP` must map the Expense API's machine client (same client as the QBO calls) to the
-  tenant. If it does not, every Parsely call fails and this route returns 502.
 - The frontend must send the Cognito **ID token** (it carries `custom:tenantId`); an access token gets 403.

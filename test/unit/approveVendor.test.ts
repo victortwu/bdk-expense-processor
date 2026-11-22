@@ -150,4 +150,18 @@ describe('approveVendor', () => {
     expect(res.statusCode).toBe(400)
     expect(global.fetch).not.toHaveBeenCalled()
   })
+
+  test('a human-owned item is not moved to pending_validation (the hold wins → 409)', async () => {
+    ddbMock.on(UpdateCommand).rejects(
+      Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' }),
+    )
+    mockFetch(jsonResponse(201, { id: '77', displayName: 'Acme' }))
+
+    const res = await approveVendor(buildEvent({ documentId: DOC_ID, vendorName: 'Acme' }), ddb)
+
+    expect(res.statusCode).toBe(409)
+    const cond = (ddbMock.commandCalls(UpdateCommand)[0].args[0].input as { ConditionExpression?: string })
+      .ConditionExpression
+    expect(cond).toContain('#bookingOwner <> :human')
+  })
 })

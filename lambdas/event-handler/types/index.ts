@@ -69,7 +69,8 @@ export interface RuleResult {
   status: 'ready' | 'needs_input'
   parsedLines?: ParsedLine[]
   validationErrors?: ValidationError[]
-  needsInputType?: NeedsInputType
+  /** Rules never produce `review` (human-created only), so it is not a notification type. */
+  needsInputType?: Exclude<NeedsInputType, 'review'>
   qboPayload?: QboPayload
 }
 

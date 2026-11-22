@@ -7,11 +7,8 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 process.env.TABLE_NAME = 'test-expense-table'
 process.env.QBO_SERVICE_URL = 'https://qbo-service.test'
 process.env.PARSELY_API_URL = 'https://parsely.test'
-process.env.MACHINE_CLIENT_ID = 'm2m-client'
 
-jest.mock('../../lambdas/shared/auth/getAuthToken', () => ({
-  getAuthToken: jest.fn().mockResolvedValue('test-token'),
-}))
+const JWT = 'Bearer caller.jwt.token'
 
 import { createExpenseFromDocument } from '../../lambdas/api/handlers/createExpenseFromDocument'
 import { handler } from '../../lambdas/api/index'
@@ -42,6 +39,7 @@ const event = (
 ) =>
   ({
     body: undefined,
+    headers: { authorization: JWT },
     pathParameters: id ? { documentId: id } : {},
     requestContext: { authorizer: { jwt: { claims } } },
   }) as unknown as APIGatewayProxyEventV2WithJWTAuthorizer
@@ -96,14 +94,48 @@ describe('createExpenseFromDocument', () => {
     expect(table.get(`DOC#${DOC}`, 'state')).toMatchObject({ status: 'needs_input' })
   })
 
-  it('calls Parsely with the machine token and never QBO', async () => {
+  it("forwards the caller's own JWT to Parsely; every fetch targets Parsely, never QBO or Cognito", async () => {
     await call(event())
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock).toHaveBeenCalledWith(
       `https://parsely.test/documents/${DOC}`,
-      expect.objectContaining({ headers: { Authorization: 'Bearer test-token' } }),
+      expect.objectContaining({ headers: { Authorization: JWT } }),
     )
+    for (const [url] of fetchMock.mock.calls) {
+      expect(new URL(String(url)).host).toBe('parsely.test')
+    }
+  })
+
+  it('a hung Parsely (timeout/abort) is a 502, nothing written', async () => {
+    fetchMock.mockRejectedValue(Object.assign(new Error('aborted'), { name: 'TimeoutError' }))
+
+    const res = await call(event())
+
+    expect(res.statusCode).toBe(502)
+    expect(table.get(`DOC#${DOC}`, 'state')).toBeUndefined()
+  })
+
+  it.each([401, 403])('Parsely %s (upstream auth failure) is a 502, not a created item', async (s) => {
+    parselyResponds(s)
+
+    const res = await call(event())
+
+    expect(res.statusCode).toBe(502)
+    expect(JSON.parse(res.body)).toMatchObject({ error: 'PARSELY_UNAVAILABLE' })
+    expect(table.get(`DOC#${DOC}`, 'state')).toBeUndefined()
+  })
+
+  it('fails fast with a clear error when PARSELY_API_URL is not configured', async () => {
+    const saved = process.env.PARSELY_API_URL
+    delete process.env.PARSELY_API_URL
+    try {
+      const res = await call(event())
+      expect(res.statusCode).toBe(502)
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally {
+      process.env.PARSELY_API_URL = saved
+    }
   })
 
   it('seeds empty fields when the document lacks vendor/date/amounts', async () => {
@@ -175,14 +207,8 @@ describe('createExpenseFromDocument', () => {
     expect((await call(other)).statusCode).toBe(404)
   })
 
-  it('a machine token (no tenant claim) is scoped by Parsely and accepted', async () => {
-    const res = await call(event({ client_id: 'm2m-client' }))
-
-    expect(res.statusCode).toBe(201)
-  })
-
-  it('403 for a tenant-less token that is not our machine client (never "any tenant")', async () => {
-    const res = await call(event({ client_id: 'some-user-pool-client' }))
+  it('403 for any tenant-less token (never "any tenant"), Parsely never called', async () => {
+    const res = await call(event({ client_id: 'some-client' }))
 
     expect(res.statusCode).toBe(403)
     expect(fetchMock).not.toHaveBeenCalled()
@@ -224,6 +250,7 @@ describe('routing', () => {
     const res = (await handler(
       {
         rawPath: `/expenses/from-document/${DOC}`,
+        headers: { authorization: JWT },
         requestContext: {
           http: { method: 'POST' },
           authorizer: { jwt: { claims: { 'custom:tenantId': TENANT } } },

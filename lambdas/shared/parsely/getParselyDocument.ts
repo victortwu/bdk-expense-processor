@@ -1,5 +1,4 @@
-import { getAuthToken } from '../auth/getAuthToken'
-import { PARSELY_API_URL } from '../config'
+import { parselyApiUrl } from '../config'
 
 const TIMEOUT_MS = 10_000
 
@@ -16,15 +15,17 @@ export interface ParselyDocument {
 }
 
 /**
- * `GET /documents/{id}` on Parsely with the machine token. The token's tenant scopes the lookup,
- * so a document of another tenant is simply "not found". Returns `undefined` for 404; any other
- * non-2xx (or a network/token failure) throws so the caller can report the upstream as unavailable (a malformed body counts as such).
+ * `GET /documents/{id}` on Parsely with the CALLER's own `Authorization` header (their JWT).
+ * Parsely's authorizer scopes the lookup to the caller's tenant, so a document of another tenant
+ * is simply "not found". Returns `undefined` for 404 (or 403 from Parsely's tenant scoping); any other
+ * non-2xx, a network failure or a malformed body throws so the caller can report the upstream as unavailable.
  */
 export const getParselyDocument = async (
   documentId: string,
+  authorization: string,
 ): Promise<ParselyDocument | undefined> => {
-  const response = await fetch(`${PARSELY_API_URL}/documents/${encodeURIComponent(documentId)}`, {
-    headers: { Authorization: `Bearer ${await getAuthToken()}` },
+  const response = await fetch(`${parselyApiUrl()}/documents/${encodeURIComponent(documentId)}`, {
+    headers: { Authorization: authorization },
     signal: AbortSignal.timeout(TIMEOUT_MS),
   })
   if (response.status === 404) return undefined

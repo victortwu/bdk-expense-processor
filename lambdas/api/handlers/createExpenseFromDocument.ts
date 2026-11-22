@@ -25,14 +25,12 @@ export const createExpenseFromDocument: ApiHandler = async (event, ddb) => {
     throw new ApiError(400, 'A valid documentId path parameter is required')
   }
 
-  // A user token carries its tenant. Only OUR machine client may omit it (Parsely then scopes by
-  // the machine token's tenant); any other tenant-less token is refused, never treated as "any".
-  const { 'custom:tenantId': callerTenant, client_id: clientId } =
-    event.requestContext.authorizer.jwt.claims
-  if (!callerTenant && (!clientId || clientId !== process.env.MACHINE_CLIENT_ID)) {
-    throw new ApiError(403, 'Token has no tenant')
-  }
-  const visibleToCaller = (tenantId: string) => !callerTenant || callerTenant === tenantId
+  // The caller's token must carry a tenant; a tenant-less token is refused, never treated as "any".
+  // Parsely scopes the fetch by the same JWT; the comparisons below are defense in depth.
+  const callerTenant = event.requestContext.authorizer.jwt.claims['custom:tenantId']
+  const authorization = event.headers?.authorization
+  if (!callerTenant || !authorization) throw new ApiError(403, 'Token has no tenant')
+  const visibleToCaller = (tenantId: string) => callerTenant === tenantId
 
   const repo = expenseRepo(ddb, TABLE_NAME)
   const existing = await repo.get(documentId)
@@ -43,7 +41,7 @@ export const createExpenseFromDocument: ApiHandler = async (event, ddb) => {
 
   let doc
   try {
-    doc = await getParselyDocument(documentId)
+    doc = await getParselyDocument(documentId, authorization)
   } catch (err) {
     logger.error('Parsely document fetch failed', { documentId, err })
     throw new ApiError(502, 'Parsely is unavailable — try again shortly', {

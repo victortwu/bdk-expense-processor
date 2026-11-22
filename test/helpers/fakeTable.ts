@@ -80,7 +80,8 @@ export const evalCondition = (
     }
     const right = operand(tokens[i++])
     if (op === '=') return left === right
-    if (op === '<>') return left !== right
+    // DynamoDB: a comparison against a MISSING attribute is false (so `<>` is false too).
+    if (op === '<>') return left !== undefined && left !== right
     return (left as string) < (right as string)
   }
   return parseOr()

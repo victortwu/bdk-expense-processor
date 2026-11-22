@@ -49,7 +49,7 @@ export class ExpenseApiStack extends cdk.Stack {
       `/${stageName}/datamgmt-qbo/api-url`,
     )
     // Parsely (document service) API base URL, for POST /expenses/from-document (BDK #13).
-    // Published by the Parsely API stack (or created once by hand) — see docs/e2-from-document-contract.md.
+    // Published by the Parsely Api stack (data-management-cdk): deploy it BEFORE this stack — see docs/e2-from-document-contract.md.
     const parselyApiUrl = ssm.StringParameter.valueForStringParameter(
       this,
       `/${stageName}/datamgmt/api-url`,
@@ -198,7 +198,7 @@ export class ExpenseApiStack extends cdk.Stack {
     })
 
     // E2 — open-or-create an expense from a Parsely document (BDK #13). No new IAM: the
-    // Parsely fetch is an HTTPS call with the existing machine token; no QBO call.
+    // Parsely fetch forwards the caller's JWT over HTTPS; no QBO call.
     httpApi.addRoutes({
       path: '/expenses/from-document/{documentId}',
       methods: [apigwv2.HttpMethod.POST],
