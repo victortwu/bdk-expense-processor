@@ -29,7 +29,7 @@ export const createExpenseFromDocument: ApiHandler = async (event, ddb) => {
   // Parsely scopes the fetch by the same JWT; the comparisons below are defense in depth.
   const callerTenant = event.requestContext.authorizer.jwt.claims['custom:tenantId']
   const authorization = event.headers?.authorization
-  if (!callerTenant || !authorization) throw new ApiError(403, 'Token has no tenant')
+  if (!callerTenant || !authorization) throw new ApiError(403, 'Token has no tenant or authorization')
   const visibleToCaller = (tenantId: string) => callerTenant === tenantId
 
   const repo = expenseRepo(ddb, TABLE_NAME)

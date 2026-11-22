@@ -17,7 +17,7 @@ export interface ParselyDocument {
 /**
  * `GET /documents/{id}` on Parsely with the CALLER's own `Authorization` header (their JWT).
  * Parsely's authorizer scopes the lookup to the caller's tenant, so a document of another tenant
- * is simply "not found". Returns `undefined` for 404 (or 403 from Parsely's tenant scoping); any other
+ * is simply "not found". Returns `undefined` for 404; any other
  * non-2xx, a network failure or a malformed body throws so the caller can report the upstream as unavailable.
  */
 export const getParselyDocument = async (

@@ -75,7 +75,7 @@ export const approveVendor: ApiHandler = async (event, ddbClient) => {
     })
     if (!updated) {
       return respond(409, {
-        message: 'Expense changed while approving the vendor — reload and retry',
+        message: 'Expense changed (or is held by a human) while approving the vendor — reload and retry',
       })
     }
 

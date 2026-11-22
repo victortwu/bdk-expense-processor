@@ -80,8 +80,9 @@ export const evalCondition = (
     }
     const right = operand(tokens[i++])
     if (op === '=') return left === right
-    // DynamoDB: a comparison against a MISSING attribute is false (so `<>` is false too).
-    if (op === '<>') return left !== undefined && left !== right
+    // DynamoDB: `<>` is TRUE for a MISSING attribute (unlike `=`, `<`), which is exactly what
+    // JS `!==` gives for undefined. The repo still guards with attribute_not_exists explicitly.
+    if (op === '<>') return left !== right
     return (left as string) < (right as string)
   }
   return parseOr()
