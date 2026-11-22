@@ -13,15 +13,25 @@ import { getParselyDocument } from '../../shared/parsely/getParselyDocument'
 import { logger } from '../../shared/utils/logger'
 import { TABLE_NAME } from '../constants'
 
+/** Parsely document ids are ULIDs/UUIDs; anything else (e.g. `..`) never reaches the upstream URL. */
+const DOCUMENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
+
 const notFound = (documentId: string) =>
   new ApiError(404, `Document not found: ${documentId}`, { error: 'DOCUMENT_NOT_FOUND' })
 
 export const createExpenseFromDocument: ApiHandler = async (event, ddb) => {
   const documentId = event.pathParameters?.documentId
-  if (!documentId) throw new ApiError(400, 'documentId path parameter is required')
+  if (!documentId || !DOCUMENT_ID_PATTERN.test(documentId)) {
+    throw new ApiError(400, 'A valid documentId path parameter is required')
+  }
 
-  // Browser tokens carry the tenant; a machine token has none and is scoped by Parsely itself.
-  const callerTenant = event.requestContext.authorizer.jwt.claims['custom:tenantId']
+  // A user token carries its tenant. Only OUR machine client may omit it (Parsely then scopes by
+  // the machine token's tenant); any other tenant-less token is refused, never treated as "any".
+  const { 'custom:tenantId': callerTenant, client_id: clientId } =
+    event.requestContext.authorizer.jwt.claims
+  if (!callerTenant && clientId !== process.env.MACHINE_CLIENT_ID) {
+    throw new ApiError(403, 'Token has no tenant')
+  }
   const visibleToCaller = (tenantId: string) => !callerTenant || callerTenant === tenantId
 
   const repo = expenseRepo(ddb, TABLE_NAME)

@@ -2,7 +2,11 @@
 import { mockClient } from 'aws-sdk-client-mock'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb'
-import { expenseRepo, TransitionSpec } from '../../lambdas/shared/expense/expenseRepo'
+import {
+  buildTransition,
+  expenseRepo,
+  TransitionSpec,
+} from '../../lambdas/shared/expense/expenseRepo'
 import { ExpenseStatus } from '../../lambdas/shared/expense/status'
 import { ExpenseState } from '../../lambdas/shared/expense/types'
 import { installFakeTable } from '../helpers/fakeTable'
@@ -98,6 +102,27 @@ describe('expenseRepo.transition', () => {
     })
     expect(current()).not.toHaveProperty('failureReason')
     expect(current()).not.toHaveProperty('qboDocNumber')
+  })
+})
+
+describe('buildTransition', () => {
+  it.each([true, false])('uses every expression name and value it declares (guard=%s)', (guard) => {
+    const t = buildTransition(
+      {
+        unlessHumanOwned: guard,
+        from: [Ready],
+        notFrom: [Submitted],
+        to: Failed,
+        remove: ['failureReason'],
+      },
+      'now',
+    )
+    const expression = `${t.UpdateExpression} ${t.ConditionExpression}`
+
+    for (const name of Object.keys(t.ExpressionAttributeNames)) expect(expression).toContain(name)
+    for (const value of Object.keys(t.ExpressionAttributeValues))
+      expect(expression).toContain(value)
+    expect(expression.includes('#bookingOwner')).toBe(guard)
   })
 })
 

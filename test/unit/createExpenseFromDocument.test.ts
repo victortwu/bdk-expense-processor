@@ -7,6 +7,7 @@ import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
 process.env.TABLE_NAME = 'test-expense-table'
 process.env.QBO_SERVICE_URL = 'https://qbo-service.test'
 process.env.PARSELY_API_URL = 'https://parsely.test'
+process.env.MACHINE_CLIENT_ID = 'm2m-client'
 
 jest.mock('../../lambdas/shared/auth/getAuthToken', () => ({
   getAuthToken: jest.fn().mockResolvedValue('test-token'),
@@ -99,9 +100,10 @@ describe('createExpenseFromDocument', () => {
     await call(event())
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(fetchMock).toHaveBeenCalledWith(`https://parsely.test/documents/${DOC}`, {
-      headers: { Authorization: 'Bearer test-token' },
-    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      `https://parsely.test/documents/${DOC}`,
+      expect.objectContaining({ headers: { Authorization: 'Bearer test-token' } }),
+    )
   })
 
   it('seeds empty fields when the document lacks vendor/date/amounts', async () => {
@@ -174,13 +176,33 @@ describe('createExpenseFromDocument', () => {
   })
 
   it('a machine token (no tenant claim) is scoped by Parsely and accepted', async () => {
-    const res = await call(event({ client_id: 'm2m' }))
+    const res = await call(event({ client_id: 'm2m-client' }))
 
     expect(res.statusCode).toBe(201)
   })
 
+  it('403 for a tenant-less token that is not our machine client (never "any tenant")', async () => {
+    const res = await call(event({ client_id: 'some-user-pool-client' }))
+
+    expect(res.statusCode).toBe(403)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['..', 'a/b', 'a%2Fb', 'x'.repeat(129)])(
+    '400 for a malformed documentId %p, Parsely never called',
+    async (id) => {
+      expect((await call(event(undefined, id))).statusCode).toBe(400)
+      expect(fetchMock).not.toHaveBeenCalled()
+    },
+  )
+
   it.each([
     ['5xx', () => parselyResponds(503)],
+    [
+      'a document that is not the one asked for',
+      () => parselyResponds(200, { ...parselyDoc, documentId: 'OTHER' }),
+    ],
+    ['a document without a tenant', () => parselyResponds(200, { documentId: DOC })],
     ['network error', () => fetchMock.mockRejectedValue(new Error('ECONNRESET'))],
   ])('502 PARSELY_UNAVAILABLE on upstream %s, nothing written', async (_n, arrange) => {
     arrange()

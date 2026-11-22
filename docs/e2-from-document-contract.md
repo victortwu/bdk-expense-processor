@@ -23,12 +23,13 @@ All error bodies use the shared envelope `{ "message": string, ...extra }`.
 | --- | --- | --- |
 | 201 | No expense existed; one was created | `{ "created": true, "expense": ExpenseState }` |
 | 200 | An expense already existed (including a lost create race); returned untouched, never reset | `{ "created": false, "expense": ExpenseState }` |
-| 400 | Missing `documentId` | `{ "message": "documentId path parameter is required" }` |
+| 400 | `documentId` is not 1-128 chars of `[A-Za-z0-9_-]` | `{ "message": "A valid documentId path parameter is required" }` |
+| 403 | Token has no `custom:tenantId` and is not the Expense API's machine client | `{ "message": "Token has no tenant" }` |
 | 404 | Parsely has no such document for the caller's tenant, or the document/expense belongs to another tenant | `{ "message": "Document not found: {id}", "error": "DOCUMENT_NOT_FOUND" }` |
 | 502 | Parsely unreachable, token failure, or non-2xx other than 404 | `{ "message": "Parsely is unavailable — try again shortly", "error": "PARSELY_UNAVAILABLE" }` |
 | 500 | Unexpected | `{ "message": "Internal server error" }` |
 
-There is no 409. Status 401/403 come from the API Gateway JWT authorizer.
+There is no 409. A 401 comes from the API Gateway JWT authorizer. The Parsely call times out after 10 s (then 502).
 
 The FE decides what to do from `created` and `expense.status`:
 a 200 with `expense.status === 'submitted'` means the document is already booked: open it read-only.
@@ -72,9 +73,10 @@ a 200 with `expense.status === 'submitted'` means the document is already booked
 
 ## Tenant scoping
 
+- A returned document must carry a string `tenantId` and the requested `documentId`, else it is treated as an upstream failure (502).
 - Parsely is called with the Expense API's machine token; Parsely scopes the lookup to that token's tenant.
 - If the caller's JWT has `custom:tenantId`, it must equal the document's tenant (and, for an existing item, the
-  item's tenant); otherwise 404 (no existence leak). A machine-token caller has no tenant claim and is accepted.
+  item's tenant); otherwise 404 (no existence leak). Only the Expense API's own machine client (`client_id` = `MACHINE_CLIENT_ID`) may omit the tenant claim; any other tenant-less token gets 403.
 
 ## Infrastructure (for the deploy)
 

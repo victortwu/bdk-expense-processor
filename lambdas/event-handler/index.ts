@@ -223,7 +223,7 @@ export const handler: SQSHandler = async (event) => {
       )
 
       if (!saved) {
-        logger.info('Record left untouched (user-skipped or already submitted)')
+        logger.info('Record left untouched (skipped, submitted or human-owned)')
         continue
       }
 
