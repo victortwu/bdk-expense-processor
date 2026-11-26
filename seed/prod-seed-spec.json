@@ -1,0 +1,44 @@
+{
+  "paymentAccount": "Visa",
+  "catchAllAccount": "Uncategorized Expense",
+  "categoryToAccount": {
+    "delivery": "Freight & Delivery",
+    "food": "Food Purchases - COS",
+    "janitorial": "Janitorial Supplies",
+    "other": "Uncategorized Expense",
+    "packaging": "Packaging and Supplies - COGS",
+    "smallwares": "Smallwares"
+  },
+  "matchThreshold": 0.9,
+  "arithmeticTolerance": 0.05,
+  "rules": [
+    {
+      "vendorSlug": "liberty-mutual",
+      "ruleType": "amount_range",
+      "qboVendor": "Liberty Mutual Insurance",
+      "defaultAccount": "Insurance - Liability"
+    },
+    {
+      "vendorSlug": "city-of-seattle",
+      "ruleType": "amount_range",
+      "qboVendor": "Seattle City Light",
+      "defaultAccount": "Utilities electric"
+    },
+    {
+      "vendorSlug": "west-coast-pita",
+      "ruleType": "catalog_reconcile",
+      "qboVendor": "West Coast Pita & Foods, Inc"
+    },
+    {
+      "vendorSlug": "centurylink",
+      "ruleType": "amount_range",
+      "defaultAccount": "Utilities Phone/Internet"
+    },
+    { "vendorSlug": "are-seattle", "ruleType": "amount_range", "defaultAccount": "Rent or Lease" },
+    {
+      "vendorSlug": "franz-bakery",
+      "ruleType": "amount_range",
+      "defaultAccount": "Food Purchases - COS"
+    }
+  ]
+}
