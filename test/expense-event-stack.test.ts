@@ -1,11 +1,19 @@
 import * as cdk from 'aws-cdk-lib'
 import { Template } from 'aws-cdk-lib/assertions'
 import { ExpenseEventStack } from '../lib/stacks/expense-event-stack'
+import { SQS_MAX_RETENTION_DAYS, StageConfig, stages } from '../config'
+import { createStacks } from '../lib/create-stacks'
+
+const stageByName = (name: string): StageConfig => {
+  const stage = stages.find((s) => s.stageName === name)
+  if (!stage) throw new Error(`Stage ${name} not found in config.ts`)
+  return stage
+}
 
 const createStack = () => {
   const app = new cdk.App()
   const stack = new ExpenseEventStack(app, 'TestStack', {
-    stage: { stageName: 'Beta' },
+    stage: stageByName('Beta'),
   })
   return Template.fromStack(stack)
 }
@@ -166,5 +174,89 @@ describe('ExpenseEventStack', () => {
     template.hasResourceProperties('AWS::SSM::Parameter', {
       Name: '/Beta/datamgmt-expense-processor/kms-key-arn',
     })
+  })
+})
+
+describe('ExpenseEventStack autoProcess arming switch', () => {
+  const templateFor = (stageName: string) =>
+    Template.fromStack(
+      new ExpenseEventStack(new cdk.App(), 'TestStack', { stage: stageByName(stageName) }),
+    )
+
+  const mappingFor = (stageName: string) =>
+    templateFor(stageName).findResources('AWS::Lambda::EventSourceMapping')
+
+  const queueRetentions = (stageName: string) => {
+    const queues = Object.values(templateFor(stageName).findResources('AWS::SQS::Queue'))
+    const main = queues.find((q) => q.Properties.RedrivePolicy)
+    const dlq = queues.find((q) => !q.Properties.RedrivePolicy)
+    return {
+      main: main?.Properties.MessageRetentionPeriod,
+      dlq: dlq?.Properties.MessageRetentionPeriod,
+    }
+  }
+
+  test('Beta stage config arms the SQS event source mapping (CFN default: enabled)', () => {
+    const mappings = Object.values(mappingFor('Beta'))
+    expect(mappings).toHaveLength(1)
+    expect(mappings[0].Properties.Enabled).not.toBe(false)
+  })
+
+  test.each([
+    [true, false],
+    [false, true],
+  ])('autoProcess=%s on a synthetic stage: Enabled=false is %s', (autoProcess, disabled) => {
+    const stage = { ...stageByName('Beta'), autoProcess }
+    const mappings = Object.values(
+      Template.fromStack(
+        new ExpenseEventStack(new cdk.App(), 'TestStack', { stage }),
+      ).findResources('AWS::Lambda::EventSourceMapping'),
+    )
+    expect(mappings).toHaveLength(1)
+    if (disabled) expect(mappings[0].Properties.Enabled).toBe(false)
+    else expect(mappings[0].Properties.Enabled).toBeUndefined()
+  })
+
+  test('Prod config is disarmed', () => {
+    const mappings = Object.values(mappingFor('Prod'))
+    expect(mappings).toHaveLength(1)
+    expect(mappings[0].Properties.Enabled).toBe(false)
+  })
+
+  test('Prod buffers events for 14 days; Beta keeps the SQS default', () => {
+    expect(queueRetentions('Beta').main).toBeUndefined()
+    expect(queueRetentions('Prod').main).toBe(SQS_MAX_RETENTION_DAYS * 24 * 3600)
+  })
+
+  test('DLQ retention is at least the main queue retention in every stage', () => {
+    for (const { stageName } of stages) {
+      const { main, dlq } = queueRetentions(stageName)
+      expect(dlq).toBeGreaterThanOrEqual(main ?? 4 * 24 * 3600)
+    }
+  })
+
+  test('rejects a queue retention beyond the SQS maximum', () => {
+    const stage = { ...stageByName('Prod'), queueRetentionDays: SQS_MAX_RETENTION_DAYS + 1 }
+    expect(() => new ExpenseEventStack(new cdk.App(), 'TestStack', { stage })).toThrow(
+      /queueRetentionDays/,
+    )
+  })
+
+  test.each([0, SQS_MAX_RETENTION_DAYS + 1])('rejects queueRetentionDays=%s', (days) => {
+    const stage = { ...stageByName('Prod'), queueRetentionDays: days }
+    expect(() => new ExpenseEventStack(new cdk.App(), 'TestStack', { stage })).toThrow(
+      /queueRetentionDays must be between 1 and 14/,
+    )
+  })
+
+  test('createStacks deploys Prod stacks to the Prod account and region', () => {
+    const prod = createStacks(new cdk.App(), stages).find(
+      (s) => s.event.stackName === 'Prod-BDK-ExpenseProcessorEventStack',
+    )
+    expect(prod).toBeDefined()
+    for (const stack of [prod!.event, prod!.api]) {
+      expect(stack.account).toBe('639914975031')
+      expect(stack.region).toBe('us-west-2')
+    }
   })
 })

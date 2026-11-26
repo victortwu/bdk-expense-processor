@@ -13,7 +13,7 @@ import * as path from 'path'
 import { StageConfig } from '../../config'
 
 interface ExpenseApiStackProps extends cdk.StackProps {
-  stage: StageConfig
+  stage: Pick<StageConfig, 'stageName'>
 }
 
 export class ExpenseApiStack extends cdk.Stack {

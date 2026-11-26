@@ -12,7 +12,7 @@ import { Runtime } from 'aws-cdk-lib/aws-lambda'
 import { Bucket } from 'aws-cdk-lib/aws-s3'
 import { Construct } from 'constructs'
 import * as path from 'path'
-import { StageConfig } from '../../config'
+import { SQS_MAX_RETENTION_DAYS, StageConfig } from '../../config'
 
 interface ExpenseEventStackProps extends cdk.StackProps {
   stage: StageConfig
@@ -77,10 +77,20 @@ export class ExpenseEventStack extends cdk.Stack {
       sortKey: { name: 'updatedAt', type: dynamodb.AttributeType.STRING },
     })
 
+    if (
+      stage.queueRetentionDays !== undefined &&
+      (stage.queueRetentionDays < 1 || stage.queueRetentionDays > SQS_MAX_RETENTION_DAYS)
+    ) {
+      throw new Error(
+        `queueRetentionDays must be between 1 and ${SQS_MAX_RETENTION_DAYS} (SQS maximum), got ${stage.queueRetentionDays}`,
+      )
+    }
+
     // ─── SQS Dead Letter Queue ─────────────────────────────────────────────────
 
     const dlq = new sqs.Queue(this, 'ExpenseProcessorDlq', {
-      retentionPeriod: cdk.Duration.days(14),
+      // Always the SQS maximum, so it is >= the main queue's retention (SQS keeps the original enqueue time).
+      retentionPeriod: cdk.Duration.days(SQS_MAX_RETENTION_DAYS),
       encryption: sqs.QueueEncryption.KMS,
       encryptionMasterKey: key,
     })
@@ -88,6 +98,10 @@ export class ExpenseEventStack extends cdk.Stack {
     // ─── SQS Queue ─────────────────────────────────────────────────────────────
 
     const queue = new sqs.Queue(this, 'ExpenseProcessorQueue', {
+      retentionPeriod:
+        stage.queueRetentionDays !== undefined
+          ? cdk.Duration.days(stage.queueRetentionDays)
+          : undefined,
       visibilityTimeout: cdk.Duration.seconds(300),
       encryption: sqs.QueueEncryption.KMS,
       encryptionMasterKey: key,
@@ -171,6 +185,8 @@ export class ExpenseEventStack extends cdk.Stack {
     eventHandlerLambda.addEventSource(
       new lambdaEventSources.SqsEventSource(queue, {
         batchSize: 1,
+        // Omit when armed: CFN defaults to enabled, which keeps the Beta template byte-identical.
+        enabled: stage.autoProcess ? undefined : false,
       }),
     )
 
