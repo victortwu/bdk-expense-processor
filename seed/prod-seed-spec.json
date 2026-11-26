@@ -12,6 +12,7 @@
   "matchThreshold": 0.9,
   "arithmeticTolerance": 0.05,
   "rules": [
+    { "vendorSlug": "restaurant-depot", "ruleType": "catalog_reconcile", "qboVendor": "Restaurant Depot" },
     {
       "vendorSlug": "liberty-mutual",
       "ruleType": "amount_range",
