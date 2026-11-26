@@ -1,5 +1,5 @@
 {
-  "paymentAccount": "Visa",
+  "paymentAccount": "Default Credit Card",
   "catchAllAccount": "Uncategorized Expense",
   "categoryToAccount": {
     "delivery": "Freight & Delivery",
@@ -12,7 +12,11 @@
   "matchThreshold": 0.9,
   "arithmeticTolerance": 0.05,
   "rules": [
-    { "vendorSlug": "restaurant-depot", "ruleType": "catalog_reconcile", "qboVendor": "Restaurant Depot" },
+    {
+      "vendorSlug": "restaurant-depot",
+      "ruleType": "catalog_reconcile",
+      "qboVendor": "Restaurant Depot"
+    },
     {
       "vendorSlug": "liberty-mutual",
       "ruleType": "amount_range",
@@ -33,13 +37,20 @@
     {
       "vendorSlug": "centurylink",
       "ruleType": "amount_range",
-      "defaultAccount": "Utilities Phone/Internet"
+      "defaultAccount": "Utilities Phone/Internet",
+      "qboVendor": "Century Link"
     },
-    { "vendorSlug": "are-seattle", "ruleType": "amount_range", "defaultAccount": "Rent or Lease" },
+    {
+      "vendorSlug": "are-seattle",
+      "ruleType": "amount_range",
+      "defaultAccount": "Rent or Lease",
+      "qboVendor": "ARE-Seattle No. 53, LLC"
+    },
     {
       "vendorSlug": "franz-bakery",
       "ruleType": "amount_range",
-      "defaultAccount": "Food Purchases - COS"
+      "defaultAccount": "Food Purchases - COS",
+      "qboVendor": "Franz Bakery"
     }
   ]
 }
